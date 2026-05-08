@@ -17,6 +17,8 @@
 //#define AT_PRINTF(...) GGML_LOG_DEBUG(__VA_ARGS__)
 #define AT_PRINTF(...)
 
+#define GOOFY_PRINTF(...) GGML_LOG_ERROR(__VA_ARGS__)
+
 // ops that return true for this function must not use restrict pointers for their backend implementations
 bool ggml_op_can_inplace(enum ggml_op op) {
     switch (op) {
@@ -965,9 +967,19 @@ bool ggml_gallocr_reserve(ggml_gallocr_t galloc, struct ggml_cgraph *graph) {
     return ggml_gallocr_reserve_n(galloc, graph, NULL, NULL);
 }
 
+
 static void ggml_gallocr_init_tensor(ggml_gallocr_t galloc, struct ggml_tensor * tensor, struct tensor_alloc * tensor_alloc) {
+    
+    // GOOFY_PRINTF("gallocr_init:%s\n", ggml_get_name(tensor));
+
     int buffer_id = tensor_alloc->buffer_id;
     assert(tensor->data || tensor->view_src || ggml_backend_buft_get_alloc_size(galloc->bufts[buffer_id], tensor) <= tensor_alloc->size_max);
+    bool goofy_debug = false;
+
+    if(strstr(ggml_get_name(tensor), "ffn_down_exps") || strstr(ggml_get_name(tensor), "ffn_gate_exps") || strstr(ggml_get_name(tensor), "ffn_up_exps")) {
+        goofy_debug = true;
+        GOOFY_PRINTF("gallocr_init:%s, size:%lld\n", ggml_get_name(tensor), ggml_nbytes(tensor));
+    }
 
     if (tensor->view_src != NULL) {
         if (tensor->buffer == NULL) {
@@ -979,11 +991,14 @@ static void ggml_gallocr_init_tensor(ggml_gallocr_t galloc, struct ggml_tensor *
             ggml_backend_view_init(tensor);
         }
     } else {
+        //goofy:expert going here
         if (tensor->data == NULL) {
             assert(tensor_alloc->addr.offset != SIZE_MAX);
             assert(ggml_backend_buft_get_alloc_size(galloc->bufts[buffer_id], tensor) <= tensor_alloc->size_max);
+            //goofy:expert already allocated, not allocated here
             ggml_vbuffer_tensor_alloc(galloc->buffers[buffer_id], tensor, tensor_alloc->addr);
         } else {
+            // expert tensor already have buffer
             if (tensor->buffer == NULL) {
                 // this tensor was allocated without ggml-backend
                 return;
