@@ -14408,6 +14408,16 @@ typedef struct {
     bool layer_hot_inited[48];  //if this layer already have hot experts
 } offload_simulate_t;
 
+typedef struct {
+    ggml_backend_buffer_t offload_down_exps_buffer;
+    ggml_backend_buffer_t offload_up_exps_buffer;
+    ggml_backend_buffer_t offload_gate_exps_buffer;
+    bool is_inited;
+    ggml_tallocr down_tallocr;
+    ggml_tallocr up_tallocr;
+    ggml_tallocr gate_tallocr;
+} offload_buffer_manager_t;
+
 int get_layer_id(ggml_tensor * tensor)
 {   
     const char* name = ggml_get_name(tensor);
@@ -14433,6 +14443,38 @@ int get_layer_id(ggml_tensor * tensor)
     char num_str[64];
     strcpy(num_str, str + start);
     return atoi(num_str);
+}
+
+offload_buffer_manager_t offload_buffer_manager = {0};
+
+void offload_buffer_manager_init(void)
+{   
+    GOOFY_VK_LOG_DEBUG("offload_buffer_manager_init");
+    ggml_backend_buffer_type_t buft = ggml_backend_vk_buffer_type(0);  //hard code device 0 
+
+    //hard code size
+    size_t up_size = 207618048;
+    size_t gate_size = 207618048;
+    size_t down_size = 308281344;
+
+    offload_buffer_manager.offload_up_exps_buffer = ggml_backend_vk_buffer_type_alloc_buffer(buft, up_size);
+    offload_buffer_manager.offload_gate_exps_buffer = ggml_backend_vk_buffer_type_alloc_buffer(buft, gate_size);
+    offload_buffer_manager.offload_down_exps_buffer = ggml_backend_vk_buffer_type_alloc_buffer(buft, down_size);
+
+    offload_buffer_manager.up_tallocr = ggml_tallocr_new(offload_buffer_manager.offload_up_exps_buffer);
+    offload_buffer_manager.gate_tallocr = ggml_tallocr_new(offload_buffer_manager.offload_gate_exps_buffer);
+    offload_buffer_manager.down_tallocr = ggml_tallocr_new(offload_buffer_manager.offload_down_exps_buffer);
+
+    void * up_addr = (char *)ggml_backend_buffer_get_base(offload_buffer_manager.up_tallocr.buffer) + offload_buffer_manager.up_tallocr.offset;
+    void * gate_addr = (char *)ggml_backend_buffer_get_base(offload_buffer_manager.gate_tallocr.buffer) + offload_buffer_manager.gate_tallocr.offset;
+    void * down_addr = (char *)ggml_backend_buffer_get_base(offload_buffer_manager.down_tallocr.buffer) + offload_buffer_manager.down_tallocr.offset;
+
+    GOOFY_VK_LOG_DEBUG("up_addr" << up_addr << "gate_addr" << gate_addr << "down_addr" << down_addr);
+
+    offload_buffer_manager.is_inited = true;
+    GGML_ASSERT(offload_buffer_manager.offload_up_exps_buffer != nullptr);
+    GGML_ASSERT(offload_buffer_manager.offload_gate_exps_buffer != nullptr);
+    GGML_ASSERT(offload_buffer_manager.offload_down_exps_buffer != nullptr);
 }
 
 offload_simulate_t offload_manager = {0};
@@ -14483,6 +14525,11 @@ void offload_manager_input_process(int layer_id, std::vector<int32_t> argsort_bu
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+
+    if(!offload_buffer_manager.is_inited)
+    {
+        offload_buffer_manager_init();
+    }
 
     if (vk_instance.debug_utils_support) {
         vk::DebugUtilsLabelEXT dul = {};
@@ -14772,10 +14819,36 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                       (almost_ready && !ctx->almost_ready_fence_pending) || 
                       (goofy_test_ffn_submit);
 
-        // if(goofy_test_ffn_submit)
-        // {
-        //     GOOFY_VK_LOG_DEBUG(ggml_get_name(cgraph->nodes[i]));
-        // }
+        if(cgraph->nodes[i]->op == GGML_OP_MUL_MAT_ID)
+        {   
+            // GOOFY_VK_LOG_DEBUG("i=" << i << " submit_node_idx=" << submit_node_idx);
+            target_str = "ffn_moe_gate-";
+            if(find_expected_node(cgraph->nodes[i], target_str))
+            {
+                // GOOFY_VK_LOG_DEBUG(ggml_get_name(cgraph->nodes[i]));
+                cgraph->nodes[i]->buffer = offload_buffer_manager.offload_gate_exps_buffer;
+                cgraph->nodes[i]->data = (char *)ggml_backend_buffer_get_base(offload_buffer_manager.gate_tallocr.buffer) + offload_buffer_manager.gate_tallocr.offset;
+                ggml_backend_vk_buffer_init_tensor(offload_buffer_manager.offload_gate_exps_buffer, cgraph->nodes[i]);
+            }
+            
+            target_str = "ffn_moe_up-";
+            if(find_expected_node(cgraph->nodes[i], target_str))
+            {
+                // GOOFY_VK_LOG_DEBUG(ggml_get_name(cgraph->nodes[i]));
+                cgraph->nodes[i]->buffer = offload_buffer_manager.offload_up_exps_buffer;
+                cgraph->nodes[i]->data = (char *)ggml_backend_buffer_get_base(offload_buffer_manager.up_tallocr.buffer) + offload_buffer_manager.up_tallocr.offset;
+                ggml_backend_vk_buffer_init_tensor(offload_buffer_manager.offload_up_exps_buffer, cgraph->nodes[i]);
+            }
+
+            target_str = "ffn_moe_down-";
+            if(find_expected_node(cgraph->nodes[i], target_str))
+            {
+                // GOOFY_VK_LOG_DEBUG(ggml_get_name(cgraph->nodes[i]));
+                cgraph->nodes[i]->buffer = offload_buffer_manager.offload_down_exps_buffer;
+                cgraph->nodes[i]->data = (char *)ggml_backend_buffer_get_base(offload_buffer_manager.down_tallocr.buffer) + offload_buffer_manager.down_tallocr.offset;
+                ggml_backend_vk_buffer_init_tensor(offload_buffer_manager.offload_down_exps_buffer, cgraph->nodes[i]);
+            }
+        }
 
         bool enqueued = ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx], submit_node_idx, i + ctx->num_additional_fused_ops >= last_node, almost_ready, submit);
 

@@ -16,6 +16,7 @@
 #include <numeric>
 #include <sstream>
 #include <unordered_set>
+#include <iostream>
 
 // dedup helpers
 
@@ -1001,6 +1002,7 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * cur, // ggml_tensor * b
           ggml_tensor * ids) const {
     ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
+    // std::cout << ggml_get_name(w) << " bytes:" << ggml_nbytes(w) << std::endl;
     for (const auto & lora : *loras) {
         llama_adapter_lora_weight * lw = lora.first->get_weight(w);
         if (lw == nullptr) {
@@ -1455,6 +1457,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         up  = ggml_view_3d(ctx0, gate_up, n_ff, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], n_ff * gate_up->nb[0]);
         cb(up, "ffn_moe_up", il);
     } else {
+        // std::cout << ggml_get_name(up_exps) << " bytes:" << ggml_nbytes(up_exps) << std::endl;
         // separate gate and up path
         up = build_lora_mm_id(up_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
@@ -1474,6 +1477,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (gate_exps) {
+            // std::cout << ggml_get_name(gate_exps) << " bytes:" << ggml_nbytes(gate_exps) << std::endl;
             cur = build_lora_mm_id(gate_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
         } else {
@@ -1564,6 +1568,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
+    // std::cout << ggml_get_name(down_exps) << " bytes:" << ggml_nbytes(down_exps) << std::endl;
     experts = build_lora_mm_id(down_exps, cur, selected_experts); // [n_embd, n_expert_used, n_tokens]
     cb(experts, "ffn_moe_down", il);
 

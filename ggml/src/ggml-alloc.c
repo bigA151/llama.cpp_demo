@@ -978,7 +978,7 @@ static void ggml_gallocr_init_tensor(ggml_gallocr_t galloc, struct ggml_tensor *
 
     if(strstr(ggml_get_name(tensor), "ffn_down_exps") || strstr(ggml_get_name(tensor), "ffn_gate_exps") || strstr(ggml_get_name(tensor), "ffn_up_exps")) {
         goofy_debug = true;
-        GOOFY_PRINTF("gallocr_init:%s, size:%lld\n", ggml_get_name(tensor), ggml_nbytes(tensor));
+        // GOOFY_PRINTF("gallocr_init:%s, size:%lld\n", ggml_get_name(tensor), ggml_nbytes(tensor));
     }
 
     if (tensor->view_src != NULL) {
