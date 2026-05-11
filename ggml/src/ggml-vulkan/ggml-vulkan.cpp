@@ -43,6 +43,9 @@ DispatchLoaderDynamic & ggml_vk_default_dispatcher();
 #include <future>
 #include <thread>
 
+#include <filesystem>
+#include <fstream>
+
 #if defined(_MSC_VER)
 # define NOMINMAX 1
 # include <windows.h>
@@ -14447,6 +14450,10 @@ int get_layer_id(ggml_tensor * tensor)
 
 offload_buffer_manager_t offload_buffer_manager = {0};
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 void offload_buffer_manager_init(void)
 {   
     GOOFY_VK_LOG_DEBUG("offload_buffer_manager_init");
@@ -14476,6 +14483,10 @@ void offload_buffer_manager_init(void)
     GGML_ASSERT(offload_buffer_manager.offload_gate_exps_buffer != nullptr);
     GGML_ASSERT(offload_buffer_manager.offload_down_exps_buffer != nullptr);
 }
+
+#ifdef __cplusplus
+}
+#endif
 
 offload_simulate_t offload_manager = {0};
 
@@ -14813,41 +14824,64 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         std::string target_str = "ffn_moe_weights-";
         std::string target_str_no = "reshaped"; 
         bool goofy_test_ffn_submit = (find_expected_node(cgraph->nodes[i], target_str)) && (!find_expected_node(cgraph->nodes[i], target_str_no));
+        //bool goofy_test_ffn_submit = false;
         bool submit = (submitted_nodes >= nodes_per_submit) ||
                       (mul_mat_bytes_per_submit != 0 && mul_mat_bytes >= mul_mat_bytes_per_submit) ||
                       (i + ctx->num_additional_fused_ops >= last_node) ||
                       (almost_ready && !ctx->almost_ready_fence_pending) || 
                       (goofy_test_ffn_submit);
 
-        if(cgraph->nodes[i]->op == GGML_OP_MUL_MAT_ID)
+        // if(cgraph->nodes[i]->op == GGML_OP_MUL_MAT_ID)
+        if(0)
         {   
             // GOOFY_VK_LOG_DEBUG("i=" << i << " submit_node_idx=" << submit_node_idx);
             target_str = "ffn_moe_gate-";
             if(find_expected_node(cgraph->nodes[i], target_str))
-            {
+            {   
+                ggml_vk_synchronize(ctx);
                 // GOOFY_VK_LOG_DEBUG(ggml_get_name(cgraph->nodes[i]));
-                cgraph->nodes[i]->buffer = offload_buffer_manager.offload_gate_exps_buffer;
-                cgraph->nodes[i]->data = (char *)ggml_backend_buffer_get_base(offload_buffer_manager.gate_tallocr.buffer) + offload_buffer_manager.gate_tallocr.offset;
-                ggml_backend_vk_buffer_init_tensor(offload_buffer_manager.offload_gate_exps_buffer, cgraph->nodes[i]);
+                // GOOFY_VK_LOG_DEBUG(cgraph->nodes[i]->data);
+                // GOOFY_VK_LOG_DEBUG(ggml_get_name(cgraph->nodes[i]->src[0]));
+                // GOOFY_VK_LOG_DEBUG(ggml_nbytes(cgraph->nodes[i]->src[0]) << "bytes");
+                // GOOFY_VK_LOG_DEBUG(cgraph->nodes[i]->src[0]->data);
+                // GOOFY_VK_LOG_DEBUG(" ");
+
+                // cgraph->nodes[i]->src[0]->buffer = offload_buffer_manager.offload_gate_exps_buffer;
+                // cgraph->nodes[i]->src[0]->data = (char *)ggml_backend_buffer_get_base(offload_buffer_manager.gate_tallocr.buffer) + offload_buffer_manager.gate_tallocr.offset;
+                
+                // const std::string ffn_exps_output_dir = "ffn_exps_weights";
+                // std::string output_path = ffn_exps_output_dir + "/" + ggml_get_name(cgraph->nodes[i]->src[0]);
+                // if (std::filesystem::exists(output_path)){
+                //     std::ifstream file(output_path, std::ios::binary);
+                //     std::vector<char> weight_buf(ggml_nbytes(cgraph->nodes[i]->src[0]));
+
+                //     if (!file.read(weight_buf.data(), ggml_nbytes(cgraph->nodes[i]->src[0]))) {
+                //         std::cerr << "Failed to read weight file: " << output_path << std::endl;
+                //     }
+                //     ggml_backend_vk_set_tensor_async(backend, cgraph->nodes[i]->src[0], weight_buf.data(), 0, ggml_nbytes(cgraph->nodes[i]->src[0]));
+                //     ggml_vk_synchronize(ctx);
+
+                //     // GOOFY_VK_LOG_DEBUG(ggml_get_name(cgraph->nodes[i]->src[0]) << " file exist");
+                // }
             }
             
-            target_str = "ffn_moe_up-";
-            if(find_expected_node(cgraph->nodes[i], target_str))
-            {
-                // GOOFY_VK_LOG_DEBUG(ggml_get_name(cgraph->nodes[i]));
-                cgraph->nodes[i]->buffer = offload_buffer_manager.offload_up_exps_buffer;
-                cgraph->nodes[i]->data = (char *)ggml_backend_buffer_get_base(offload_buffer_manager.up_tallocr.buffer) + offload_buffer_manager.up_tallocr.offset;
-                ggml_backend_vk_buffer_init_tensor(offload_buffer_manager.offload_up_exps_buffer, cgraph->nodes[i]);
-            }
+            // target_str = "ffn_moe_up-";
+            // if(find_expected_node(cgraph->nodes[i], target_str))
+            // {
+            //     // GOOFY_VK_LOG_DEBUG(ggml_get_name(cgraph->nodes[i]));
+            //     cgraph->nodes[i]->buffer = offload_buffer_manager.offload_up_exps_buffer;
+            //     cgraph->nodes[i]->data = (char *)ggml_backend_buffer_get_base(offload_buffer_manager.up_tallocr.buffer) + offload_buffer_manager.up_tallocr.offset;
+            //     ggml_backend_vk_buffer_init_tensor(offload_buffer_manager.offload_up_exps_buffer, cgraph->nodes[i]);
+            // }
 
-            target_str = "ffn_moe_down-";
-            if(find_expected_node(cgraph->nodes[i], target_str))
-            {
-                // GOOFY_VK_LOG_DEBUG(ggml_get_name(cgraph->nodes[i]));
-                cgraph->nodes[i]->buffer = offload_buffer_manager.offload_down_exps_buffer;
-                cgraph->nodes[i]->data = (char *)ggml_backend_buffer_get_base(offload_buffer_manager.down_tallocr.buffer) + offload_buffer_manager.down_tallocr.offset;
-                ggml_backend_vk_buffer_init_tensor(offload_buffer_manager.offload_down_exps_buffer, cgraph->nodes[i]);
-            }
+            // target_str = "ffn_moe_down-";
+            // if(find_expected_node(cgraph->nodes[i], target_str))
+            // {
+            //     // GOOFY_VK_LOG_DEBUG(ggml_get_name(cgraph->nodes[i]));
+            //     cgraph->nodes[i]->buffer = offload_buffer_manager.offload_down_exps_buffer;
+            //     cgraph->nodes[i]->data = (char *)ggml_backend_buffer_get_base(offload_buffer_manager.down_tallocr.buffer) + offload_buffer_manager.down_tallocr.offset;
+            //     ggml_backend_vk_buffer_init_tensor(offload_buffer_manager.offload_down_exps_buffer, cgraph->nodes[i]);
+            // }
         }
 
         bool enqueued = ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx], submit_node_idx, i + ctx->num_additional_fused_ops >= last_node, almost_ready, submit);
@@ -14892,6 +14926,32 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         if(goofy_test_ffn_submit)
         {
             ggml_vk_synchronize(ctx);
+
+            //node i : weights   node i+6 : ffn_moe_gate
+            int gate_idx = i + 6;
+            // GOOFY_VK_LOG_DEBUG(ggml_get_name(cgraph->nodes[gate_idx]));
+            // GOOFY_VK_LOG_DEBUG(cgraph->nodes[gate_idx]->data);
+            // GOOFY_VK_LOG_DEBUG(ggml_get_name(cgraph->nodes[gate_idx]->src[0]));
+            // GOOFY_VK_LOG_DEBUG(ggml_nbytes(cgraph->nodes[gate_idx]->src[0]) << "bytes");
+            // GOOFY_VK_LOG_DEBUG(cgraph->nodes[gate_idx]->src[0]->data);
+            // GOOFY_VK_LOG_DEBUG(" ");
+
+            cgraph->nodes[gate_idx]->src[0]->buffer = offload_buffer_manager.offload_gate_exps_buffer;
+            cgraph->nodes[gate_idx]->src[0]->data = (char *)ggml_backend_buffer_get_base(offload_buffer_manager.gate_tallocr.buffer) + offload_buffer_manager.gate_tallocr.offset;
+
+            const std::string ffn_exps_output_dir = "ffn_exps_weights";
+            std::string output_path = ffn_exps_output_dir + "/" + ggml_get_name(cgraph->nodes[gate_idx]->src[0]);
+            if (std::filesystem::exists(output_path)){
+                std::ifstream file(output_path, std::ios::binary);
+                std::vector<char> weight_buf(ggml_nbytes(cgraph->nodes[gate_idx]->src[0]));
+                // GOOFY_VK_LOG_DEBUG("read " << output_path);
+
+                if (!file.read(weight_buf.data(), ggml_nbytes(cgraph->nodes[gate_idx]->src[0]))) {
+                    std::cerr << "Failed to read weight file: " << output_path << std::endl;
+                }
+                ggml_backend_vk_set_tensor_async(backend, cgraph->nodes[gate_idx]->src[0], weight_buf.data(), 0, ggml_nbytes(cgraph->nodes[gate_idx]->src[0]));
+                ggml_vk_synchronize(ctx);                 
+            }
             
             // size_t weight_size = ggml_nbytes(cgraph->nodes[i]);
             // size_t weight_elements = ggml_nelements(cgraph->nodes[i]);

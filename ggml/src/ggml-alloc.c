@@ -91,6 +91,43 @@ enum ggml_status ggml_tallocr_alloc(struct ggml_tallocr * talloc, struct ggml_te
     return ggml_backend_tensor_alloc(talloc->buffer, tensor, addr);
 }
 
+bool goofy_first_gate_allocr = true;
+
+struct ggml_tensor * first_gate_allocr_tensor;
+
+enum ggml_status ggml_tallocr_alloc_gate_goofy(struct ggml_tallocr * talloc, struct ggml_tensor * tensor) {
+    if(goofy_first_gate_allocr){
+        GGML_LOG_ERROR("goofy_first_gate_allocr, %s\n", tensor->name);
+        size_t size = ggml_backend_buffer_get_alloc_size(talloc->buffer, tensor);
+        size = GGML_PAD(size, talloc->alignment);
+
+        if (talloc->offset + size > ggml_backend_buffer_get_size(talloc->buffer)) {
+            GGML_LOG_ERROR("%s: not enough space in the buffer to allocate %s (needed %zu, available %zu)\n",
+                    __func__, tensor->name, size, ggml_backend_buffer_get_size(talloc->buffer) - talloc->offset);
+            GGML_ABORT("not enough space in the buffer");
+        }
+
+        void * addr = (char *)ggml_backend_buffer_get_base(talloc->buffer) + talloc->offset;
+        talloc->offset += size;
+
+        assert(((uintptr_t)addr % talloc->alignment) == 0);
+
+        first_gate_allocr_tensor = tensor;
+        goofy_first_gate_allocr = false;
+
+        return ggml_backend_tensor_alloc(talloc->buffer, tensor, addr);
+    }
+    else{
+        GGML_LOG_ERROR("NO goofy_first_gate_allocr, %s\n", tensor->name);
+        tensor->buffer = first_gate_allocr_tensor->buffer;
+        tensor->data = first_gate_allocr_tensor->data;
+
+        return GGML_STATUS_SUCCESS;
+    }
+
+
+}
+
 // dynamic tensor allocator
 
 #define GGML_VBUFFER_MAX_CHUNKS 16
@@ -1141,7 +1178,7 @@ static bool alloc_tensor_range(struct ggml_context * ctx,
         struct ggml_tensor * first, struct ggml_tensor * last,
         ggml_backend_buffer_type_t buft, size_t size,
         ggml_backend_buffer_t ** buffers, size_t * n_buffers) {
-
+            
     ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(buft, size);
     if (buffer == NULL) {
         GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(buft), size);
@@ -1156,9 +1193,20 @@ static bool alloc_tensor_range(struct ggml_context * ctx,
 
     for (struct ggml_tensor * t = first; t != last; t = ggml_get_next_tensor(ctx, t)) {
         enum ggml_status status = GGML_STATUS_SUCCESS;
+
+        // if(strstr(ggml_get_name(t), "ffn_gate_exps") != NULL) {
+        //     GOOFY_PRINTF("alloc_tensor_range, %s alloc skip\n", ggml_get_name(t));
+        //     continue;
+        // }
+
         if (t->data == NULL) {
             if (t->view_src == NULL) {
-                status = ggml_tallocr_alloc(&tallocr, t);
+                if(strstr(ggml_get_name(t), "ffn_gate_exps") == NULL){
+                    status = ggml_tallocr_alloc(&tallocr, t);
+                }
+                else{
+                    ggml_tallocr_alloc_gate_goofy(&tallocr, t);
+                }
             } else if (t->buffer == NULL) {
                 status = ggml_backend_view_init(t);
             }
@@ -1195,6 +1243,12 @@ static ggml_backend_buffer_t ggml_backend_alloc_ctx_tensors_from_buft_impl(
         size_t this_size = 0;
         if (t->data == NULL && t->view_src == NULL) {
             this_size = GGML_PAD(ggml_backend_buft_get_alloc_size(buft, t), alignment);
+        }
+
+        if(strstr(ggml_get_name(t), "ffn_gate_exps") != NULL && strcmp(ggml_get_name(t), "blk.0.ffn_gate_exps.weight")) //goofy
+        {   
+            GGML_LOG_ERROR("this_size change to 0, %s\n", t->name);
+            this_size = 0;
         }
 
         if (cur_buf_size > 0 && (cur_buf_size + this_size) > max_size) {
