@@ -14448,7 +14448,7 @@ int get_layer_id(ggml_tensor * tensor)
     return atoi(num_str);
 }
 
-offload_buffer_manager_t offload_buffer_manager = {0};
+offload_buffer_manager_t offload_buffer_manager = {};
 
 #ifdef __cplusplus
 extern "C" {
@@ -14484,11 +14484,170 @@ void offload_buffer_manager_init(void)
     GGML_ASSERT(offload_buffer_manager.offload_down_exps_buffer != nullptr);
 }
 
+#define EXPERT_NOT_LOADED -1
+
+typedef struct {
+
+    ggml_backend_t backend;
+
+    ggml_backend_buffer_t offload_down_exps_buffer[48];
+    ggml_backend_buffer_t offload_up_exps_buffer[48];
+    ggml_backend_buffer_t offload_gate_exps_buffer[48];
+    bool is_inited;
+
+
+    int n_expert;
+    int n_expert_used;
+    int n_hot_expert;
+    int n_layer;
+
+    size_t up_size;
+    size_t down_size;
+    size_t gate_size;
+
+    size_t up_alloc_size;
+    size_t down_alloc_size;
+    size_t gate_alloc_size;
+
+    size_t up_size_single;
+    size_t down_size_single;
+    size_t gate_size_single;
+
+    int expert_map[256][48];
+
+    struct ggml_context * offload_ctx; //need a ctx to create tensors
+
+    struct ggml_tensor * hot_gate_tensor[48];
+    struct ggml_tensor * hot_up_tensor[48];
+    struct ggml_tensor * hot_down_tensor[48];
+
+} offload_buffer_manager_new_t;
+
+offload_buffer_manager_new_t om_519 = {};
+
+//we need a ctx to create tensor to save offload experts
+void offload_expert_ctx_init(void)
+{   
+    GOOFY_VK_LOG_DEBUG("offload_expert_ctx_init");
+    struct ggml_init_params goofy_params;
+    goofy_params.mem_size = 262144;
+    goofy_params.mem_buffer = NULL;
+    goofy_params.no_alloc = true;
+    om_519.offload_ctx = ggml_init(goofy_params);
+}
+
+//create tensors for describing hot EXPERTs
+void offload_expert_tensor_init(struct ggml_context * ctx) 
+{   
+    GOOFY_VK_LOG_DEBUG("offload_expert_tensor_init");
+    for(int i = 0; i < om_519.n_layer; i++)
+    {
+        om_519.hot_gate_tensor[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_IQ2_XXS, 3072, 180);
+        om_519.hot_gate_tensor[i]->buffer = om_519.offload_gate_exps_buffer[i];
+        om_519.hot_gate_tensor[i]->data = (char *)ggml_backend_buffer_get_base(om_519.offload_gate_exps_buffer[i]);
+
+        //need any else?
+    }
+}
+
+//load experts 0-179 at position 0-179 anyway, and init the map
+//expert_map[2][4] = 160 : layer4, expert2 is stored in buffer position 160
+//expert_map[3][5] = -1  : layer5, expert3 is not in vulkan buffer
+void offload_expert_and_map_init(void)
+{   
+    GOOFY_VK_LOG_DEBUG("offload_expert_and_map_init");
+    for (int i = 0; i < om_519.n_layer; i++) //48 layer
+    {   
+        for (int j = 0; j < om_519.n_expert; j++)
+        {   
+            if(j < om_519.n_hot_expert)
+            {
+                om_519.expert_map[j][i] = j;
+            }
+            else
+            {
+                om_519.expert_map[j][i] = EXPERT_NOT_LOADED;
+            }                                    
+        }
+        char str[20];
+        sprintf(str, "%d", i);
+
+        const std::string ffn_exps_output_dir = "ffn_exps_weights";
+
+        //temp only gate, add up down later
+        std::string output_path = ffn_exps_output_dir + "/blk." + str + ".ffn_gate_exps.weight";
+        if (std::filesystem::exists(output_path)){
+            std::ifstream file(output_path, std::ios::binary);
+            std::vector<char> weight_buf(om_519.gate_alloc_size);
+            GOOFY_VK_LOG_DEBUG("read " << output_path);
+
+            if (!file.read(weight_buf.data(), om_519.gate_alloc_size)) {
+                std::cerr << "Failed to read weight file: " << output_path << std::endl;
+            }
+            //load to vulkan buffer
+            ggml_backend_vk_set_tensor_async(om_519.backend, om_519.hot_gate_tensor[i], weight_buf.data(), 0, om_519.gate_alloc_size);
+            ggml_vk_synchronize((ggml_backend_vk_context*)om_519.backend->context);                 
+        }
+        else {
+            GOOFY_VK_LOG_DEBUG("not found " << output_path);
+        }        
+    }   
+}
+
+void offload_buffer_manager_519_init(ggml_backend_t backend)
+{
+    GOOFY_VK_LOG_DEBUG("offload_buffer_manager_519_init");
+    om_519.is_inited = true;
+    ggml_backend_buffer_type_t buft = ggml_backend_vk_buffer_type(0);  //hard code device 0 
+
+    om_519.backend = backend;
+
+    //hard code para
+
+    // single layer total experts size
+    om_519.up_size = 207618048;
+    om_519.gate_size = 207618048;
+    om_519.down_size = 308281344;
+    om_519.n_expert = 256;
+    om_519.n_expert_used = 8;
+    om_519.n_layer = 48;
+    om_519.n_hot_expert = 180;
+
+    //single layer total alloc hot size
+    om_519.up_alloc_size = om_519.up_size * om_519.n_hot_expert / om_519.n_expert;
+    om_519.down_alloc_size = om_519.down_size * om_519.n_hot_expert / om_519.n_expert;
+    om_519.gate_alloc_size = om_519.gate_size * om_519.n_hot_expert / om_519.n_expert;
+
+    //single layer layer single expert size
+    om_519.up_size_single = om_519.up_size / om_519.n_expert;
+    om_519.gate_size_single = om_519.gate_size / om_519.n_expert;
+    om_519.down_size_single = om_519.down_size / om_519.n_expert;
+
+
+    for (int i = 0; i < om_519.n_layer; i++) //48 layer
+    {   
+        GOOFY_VK_LOG_DEBUG("alloc buf " << i << " size " << om_519.gate_alloc_size);
+        om_519.offload_gate_exps_buffer[i] = ggml_backend_vk_buffer_type_alloc_buffer(buft, om_519.gate_alloc_size);
+
+        // implement this later
+        // om_519.offload_down_exps_buffer[i] = ggml_backend_vk_buffer_type_alloc_buffer(buft, om_519.down_alloc_size);        
+        // om_519.offload_up_exps_buffer[i] = ggml_backend_vk_buffer_type_alloc_buffer(buft, om_519.up_alloc_size);
+    }
+
+    offload_expert_ctx_init();
+
+    offload_expert_tensor_init(om_519.offload_ctx);
+
+    offload_expert_and_map_init(); 
+    GOOFY_VK_LOG_DEBUG("offload_buffer_manager_519_init end");
+}
+
+
 #ifdef __cplusplus
 }
 #endif
 
-offload_simulate_t offload_manager = {0};
+offload_simulate_t offload_manager = {};
 
 void offload_manager_first_input_init(int layer_id, std::vector<int32_t> argsort_buffer, int used_experts)
 {   
@@ -14540,6 +14699,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     if(!offload_buffer_manager.is_inited)
     {
         offload_buffer_manager_init();
+    }
+
+    if(!om_519.is_inited)
+    {
+        offload_buffer_manager_519_init(backend);
     }
 
     if (vk_instance.debug_utils_support) {
