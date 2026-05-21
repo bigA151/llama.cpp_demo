@@ -121,7 +121,8 @@ static bool is_pow2(uint32_t x) { return x > 1 && (x & (x-1)) == 0; }
 #define VK_LOG_DEBUG(msg) ((void) 0)
 #endif // GGML_VULKAN_DEBUG
 
-#define GOOFY_VK_LOG_DEBUG(msg) std::cerr << msg << std::endl
+// #define GOOFY_VK_LOG_DEBUG(msg) std::cerr << msg << std::endl
+#define GOOFY_VK_LOG_DEBUG(msg)
 
 struct ggml_backend_vk_context;
 
@@ -556,7 +557,7 @@ static constexpr std::initializer_list<std::array<int, 3>> topk_moe_early_softma
 //node #652 (   ARGSORT):   ffn_moe_argsort-11 (   0K) [Vulka         ] use=1:     ffn_moe_probs-11 (   0K) [Vulka         ]
 //node #653 (      VIEW):      ffn_moe_topk-11 (   0K) [Vulka         ] use=7:   ffn_moe_argsort-11 (   0K) [Vulka         ]
 //node #654 (  GET_ROWS):   ffn_moe_weights-11 (   0K) [Vulka         ] use=1: ffn_moe_probs-11 (re (   0K) [Vulka         ]      ffn_moe_topk-11 (   0K) [Vulka         ]
-//node #655 (   RESHAPE): ffn_moe_weights-11 ( (   0K) [Vulka         ] use=1:   ffn_moe_weights-11 (   0K) [Vulka         ]
+//node #655 (   RESHAPE): ffn_moe_weights-11 ( (   0K) [Vulka         ] use=1:   -11 (   0K) [Vulka         ]
 //node #656 (  SOFT_MAX):             node_656 (   0K) [Vulka         ] use=1: ffn_moe_weights-11 ( (   0K) [Vulka         ]
 //node #657 (   RESHAPE): ffn_moe_weights_soft (   0K) [Vulka         ] use=1:             node_656 (   0K) [Vulka         ]
 static constexpr std::initializer_list<std::array<int, 3>> topk_moe_late_softmax_edges {
@@ -14513,13 +14514,21 @@ typedef struct {
     size_t down_size_single;
     size_t gate_size_single;
 
-    int expert_map[256][48];
+    int expert_map[48][256];
 
     struct ggml_context * offload_ctx; //need a ctx to create tensors
 
     struct ggml_tensor * hot_gate_tensor[48];
     struct ggml_tensor * hot_up_tensor[48];
     struct ggml_tensor * hot_down_tensor[48];
+
+    int32_t argsort_buffer[256];  //save the argsort result
+    int32_t topk_buffer[8];  //used to overwrite the origin topk tensor
+
+    int32_t topk_buffer_test[8];  //used for test
+    
+    struct ggml_tensor * mapped_topk_tensor;  // temp impl
+    ggml_backend_buffer_t mapped_topk_buffer;
 
 } offload_buffer_manager_new_t;
 
@@ -14548,11 +14557,17 @@ void offload_expert_tensor_init(struct ggml_context * ctx)
 
         //need any else?
     }
+
+    ggml_backend_buffer_type_t buft = ggml_backend_vk_buffer_type(0);  //hard code device 0 
+    om_519.mapped_topk_buffer = ggml_backend_vk_buffer_type_alloc_buffer(buft, (size_t)32); //8experts * 4byte
+    om_519.mapped_topk_tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 8, 1);
+    om_519.mapped_topk_tensor->buffer = om_519.mapped_topk_buffer;
+    om_519.mapped_topk_tensor->data = (char *)ggml_backend_buffer_get_base(om_519.mapped_topk_buffer);
 }
 
 //load experts 0-179 at position 0-179 anyway, and init the map
-//expert_map[2][4] = 160 : layer4, expert2 is stored in buffer position 160
-//expert_map[3][5] = -1  : layer5, expert3 is not in vulkan buffer
+//expert_map[2][4] = 160 : layer2, expert4 is stored in buffer position 160
+//expert_map[3][5] = -1  : layer3, expert5 is not in vulkan buffer
 void offload_expert_and_map_init(void)
 {   
     GOOFY_VK_LOG_DEBUG("offload_expert_and_map_init");
@@ -14562,11 +14577,11 @@ void offload_expert_and_map_init(void)
         {   
             if(j < om_519.n_hot_expert)
             {
-                om_519.expert_map[j][i] = j;
+                om_519.expert_map[i][j] = j;
             }
             else
             {
-                om_519.expert_map[j][i] = EXPERT_NOT_LOADED;
+                om_519.expert_map[i][j] = EXPERT_NOT_LOADED;
             }                                    
         }
         char str[20];
@@ -14692,6 +14707,71 @@ void offload_manager_input_process(int layer_id, std::vector<int32_t> argsort_bu
     }
 }
 
+//judge if hot expert is in vram, if not, read from file and update the map
+void hot_expert_offload_process(int layer_id)
+{   
+    GOOFY_VK_LOG_DEBUG("hot_expert_offload_process");
+    int cur_expert_id;
+    int* expert_map = om_519.expert_map[layer_id];
+    // int expert_map[256] = om_519.expert_map[layer_id];
+    int rm_pos_idx = 255; //remove least relevent expert from the last sorted
+    int expert_rm_idx;
+    for(int i = 0; i < 8; i++)
+    {   
+        cur_expert_id = om_519.argsort_buffer[i];
+        if(expert_map[cur_expert_id] == EXPERT_NOT_LOADED)
+        {
+            //expert not in vram, load from file
+            expert_rm_idx = om_519.argsort_buffer[rm_pos_idx];
+            while(expert_map[expert_rm_idx] == EXPERT_NOT_LOADED)
+            {
+                rm_pos_idx--;
+                expert_rm_idx = om_519.argsort_buffer[rm_pos_idx];
+            }
+            expert_map[cur_expert_id] = expert_map[expert_rm_idx];
+            expert_map[expert_rm_idx] = EXPERT_NOT_LOADED;
+            GOOFY_VK_LOG_DEBUG("layer:" << layer_id << " load " << cur_expert_id << " at " << expert_map[cur_expert_id] << " remove " << expert_rm_idx);
+
+
+            //load needed tensors from file
+            char str[20];
+            sprintf(str, "%d", layer_id);
+
+            const std::string ffn_exps_output_dir = "ffn_exps_weights";
+
+            //temp only gate, add up down later
+            std::string output_path = ffn_exps_output_dir + "/blk." + str + ".ffn_gate_exps.weight";
+
+            if (std::filesystem::exists(output_path)){
+                std::ifstream file(output_path, std::ios::binary);
+                std::vector<char> weight_buf(om_519.gate_size_single);
+                GOOFY_VK_LOG_DEBUG("read " << output_path);
+
+                if(file)
+                {
+                    std::streampos offset = cur_expert_id * om_519.gate_size_single;
+                    file.seekg(offset);
+                }
+
+                if (!file.read(weight_buf.data(), om_519.gate_size_single)) {
+                    std::cerr << "Failed to read weight file: " << output_path << std::endl;
+                }
+                //load this single expert to vulkan buffer
+                ggml_backend_vk_set_tensor_async(om_519.backend, om_519.hot_gate_tensor[layer_id], weight_buf.data(), om_519.gate_size_single * expert_map[cur_expert_id], om_519.gate_size_single);
+                ggml_vk_synchronize((ggml_backend_vk_context*)om_519.backend->context);                 
+            }
+            else {
+                GOOFY_VK_LOG_DEBUG("not found " << output_path);
+            } 
+
+        }
+        else
+        {   
+            //expert in vram, do nothing
+        }
+    }
+}
+
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
@@ -14804,6 +14884,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
         ctx->fused_topk_moe_scale = false;
         const char *fusion_string {};
+
+        // disable fusion here
         if (0) {
         // if (!ctx->device->disable_fusion) {
             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
@@ -14986,14 +15068,19 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         bool almost_ready = (cgraph->n_nodes - i) < cgraph->n_nodes / 5;
         // std::string target_str = "ffn_moe_argsort-";
         std::string target_str = "ffn_moe_weights-";
-        std::string target_str_no = "reshaped"; 
+        std::string target_str_no = "reshaped";         
         bool goofy_test_ffn_submit = (find_expected_node(cgraph->nodes[i], target_str)) && (!find_expected_node(cgraph->nodes[i], target_str_no));
         //bool goofy_test_ffn_submit = false;
+
+        std::string gate_str = "ffn_moe_gate-19";
+        bool gate_op_remove = find_expected_node(cgraph->nodes[i], gate_str); //&& (ggml_nelements(cgraph->nodes[i]) == 256);
+
         bool submit = (submitted_nodes >= nodes_per_submit) ||
                       (mul_mat_bytes_per_submit != 0 && mul_mat_bytes >= mul_mat_bytes_per_submit) ||
                       (i + ctx->num_additional_fused_ops >= last_node) ||
                       (almost_ready && !ctx->almost_ready_fence_pending) || 
-                      (goofy_test_ffn_submit);
+                      (goofy_test_ffn_submit); // ||
+                    //   (gate_op_remove);
 
         // if(cgraph->nodes[i]->op == GGML_OP_MUL_MAT_ID)
         if(0)
@@ -15048,6 +15135,38 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             // }
         }
 
+        if(gate_op_remove)
+        {
+            GOOFY_VK_LOG_DEBUG("gate_rework:" << ggml_get_name(cgraph->nodes[i]));
+            
+            //judge if needed expert in vram
+            int layer_id = get_layer_id(cgraph->nodes[i]);
+            hot_expert_offload_process(layer_id);
+
+            ggml_vk_synchronize(ctx);
+            GOOFY_VK_LOG_DEBUG("write mapped_buffer");
+            for(int i = 0; i < 8; i++)
+            {
+                om_519.topk_buffer[i] = om_519.expert_map[layer_id][om_519.argsort_buffer[i]];
+                // GOOFY_VK_LOG_DEBUG(om_519.topk_buffer[i] << " ");
+            }
+            ggml_backend_vk_set_tensor_async(backend, om_519.mapped_topk_tensor, om_519.topk_buffer, 0, 32);
+            ggml_vk_synchronize(ctx);
+
+            ggml_backend_vk_get_tensor_async(backend, om_519.mapped_topk_tensor, om_519.topk_buffer_test, 0, 32);
+            ggml_vk_synchronize(ctx);
+
+            // GOOFY_VK_LOG_DEBUG("read mapped_buffer");
+            // for(int i = 0; i < 8; i++)
+            // {
+            //     GOOFY_VK_LOG_DEBUG(om_519.topk_buffer_test[i] << " ");
+            // }
+            
+            //we need to change the caculate matrix at here
+            cgraph->nodes[i]->src[0] = om_519.hot_gate_tensor[layer_id];
+            cgraph->nodes[i]->src[2] = om_519.mapped_topk_tensor;            
+        }
+
         bool enqueued = ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx], submit_node_idx, i + ctx->num_additional_fused_ops >= last_node, almost_ready, submit);
 
         if (vk_perf_logger_enabled && enqueued) {
@@ -15091,7 +15210,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         {
             ggml_vk_synchronize(ctx);
 
-            //node i : weights   node i+6 : ffn_moe_gate
+            //node i : weights   node i+6 : ffn_moe_gate  node:i-2 experts sorted,pick top k
             int gate_idx = i + 6;
             // GOOFY_VK_LOG_DEBUG(ggml_get_name(cgraph->nodes[gate_idx]));
             // GOOFY_VK_LOG_DEBUG(cgraph->nodes[gate_idx]->data);
@@ -15104,11 +15223,16 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             cgraph->nodes[gate_idx]->src[0]->data = (char *)ggml_backend_buffer_get_base(offload_buffer_manager.gate_tallocr.buffer) + offload_buffer_manager.gate_tallocr.offset;
 
             const std::string ffn_exps_output_dir = "ffn_exps_weights";
-            std::string output_path = ffn_exps_output_dir + "/" + ggml_get_name(cgraph->nodes[gate_idx]->src[0]);
+            int layer_id = get_layer_id(cgraph->nodes[i]);
+            char str[20];
+            sprintf(str, "%d", layer_id);
+            std::string output_path = ffn_exps_output_dir + "/blk." + str +".ffn_gate_exps.weight";
+            // std::string output_path = ffn_exps_output_dir + "/" + ggml_get_name(cgraph->nodes[gate_idx]->src[0]);
+
             if (std::filesystem::exists(output_path)){
                 std::ifstream file(output_path, std::ios::binary);
                 std::vector<char> weight_buf(ggml_nbytes(cgraph->nodes[gate_idx]->src[0]));
-                // GOOFY_VK_LOG_DEBUG("read " << output_path);
+                GOOFY_VK_LOG_DEBUG("read " << output_path);
 
                 if (!file.read(weight_buf.data(), ggml_nbytes(cgraph->nodes[gate_idx]->src[0]))) {
                     std::cerr << "Failed to read weight file: " << output_path << std::endl;
@@ -15121,13 +15245,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             // size_t weight_elements = ggml_nelements(cgraph->nodes[i]);
             // std::vector<float> weight_buffer(weight_size / sizeof(float));
 
-            // size_t topk_size = ggml_nbytes(cgraph->nodes[i-1]);
-            // size_t topk_elements = ggml_nelements(cgraph->nodes[i-1]);
-            // std::vector<int32_t> topk_buffer(topk_size / sizeof(int32_t));
+            size_t topk_size = ggml_nbytes(cgraph->nodes[i-1]);
+            size_t topk_elements = ggml_nelements(cgraph->nodes[i-1]);
+            std::vector<int32_t> topk_buffer(topk_size / sizeof(int32_t));
 
-            // size_t argsort_size = ggml_nbytes(cgraph->nodes[i-2]);
-            // size_t argsort_elements = ggml_nelements(cgraph->nodes[i-2]);
-            // std::vector<int32_t> argsort_buffer(argsort_size / sizeof(int32_t));
+            size_t argsort_size = ggml_nbytes(cgraph->nodes[i-2]);
+            size_t argsort_elements = ggml_nelements(cgraph->nodes[i-2]);
 
             // size_t probs_size = ggml_nbytes(cgraph->nodes[i-4]);
             // size_t probs_elements = ggml_nelements(cgraph->nodes[i-4]);
@@ -15135,23 +15258,23 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
             // ggml_backend_vk_get_tensor_async(backend, cgraph->nodes[i], weight_buffer.data(), 0, weight_size);
             // ggml_backend_vk_get_tensor_async(backend, cgraph->nodes[i-1], topk_buffer.data(), 0, topk_size);
-            // ggml_backend_vk_get_tensor_async(backend, cgraph->nodes[i-2], argsort_buffer.data(), 0, argsort_size);
+            
             // ggml_backend_vk_get_tensor_async(backend, cgraph->nodes[i-4], probs_buffer.data(), 0, probs_size);
-            // ggml_vk_synchronize(ctx);
+            
 
-            // if(topk_elements == 8)
-            // {                   
-            //     int layer_id = get_layer_id(cgraph->nodes[i]);
-            //     // printf("layer_id: %d\n", layer_id);
-            //     if (!offload_manager.layer_hot_inited[layer_id])
-            //     {
-            //         offload_manager_first_input_init(layer_id, argsort_buffer, 182);
-            //     }
-            //     else
-            //     {
-            //         offload_manager_input_process(layer_id, argsort_buffer, 8, 182);
-            //     }
-            // }
+            if(topk_elements == 8)
+            {   
+                ggml_backend_vk_get_tensor_async(backend, cgraph->nodes[i-2], om_519.argsort_buffer, 0, argsort_size);
+                ggml_vk_synchronize(ctx);
+                // int layer_id = get_layer_id(cgraph->nodes[i]);
+                // printf("argsort_buffer: [");
+                // for (int j = 0; j < 256; j++) {
+                //     printf("%d ", om_519.argsort_buffer[j]);
+                // }
+                // printf("]");           
+            }
+
+
             
             // ggml_backend_vk_set_tensor_async(backend, cgraph->nodes[i], weight_buffer.data(), 0, weight_size);
             // ggml_vk_synchronize(ctx);
