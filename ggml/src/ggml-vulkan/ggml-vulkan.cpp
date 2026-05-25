@@ -14530,6 +14530,8 @@ typedef struct {
     struct ggml_tensor * mapped_topk_tensor;  // temp impl
     ggml_backend_buffer_t mapped_topk_buffer;
 
+    bool need_offload_test;
+
 } offload_buffer_manager_new_t;
 
 offload_buffer_manager_new_t om_519 = {};
@@ -14551,7 +14553,7 @@ void offload_expert_tensor_init(struct ggml_context * ctx)
     GOOFY_VK_LOG_DEBUG("offload_expert_tensor_init");
     for(int i = 0; i < om_519.n_layer; i++)
     {
-        om_519.hot_gate_tensor[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_IQ2_XXS, 3072, 180);
+        om_519.hot_gate_tensor[i] = ggml_new_tensor_3d(ctx, GGML_TYPE_IQ2_XXS, 3072, 1024, 180);
         om_519.hot_gate_tensor[i]->buffer = om_519.offload_gate_exps_buffer[i];
         om_519.hot_gate_tensor[i]->data = (char *)ggml_backend_buffer_get_base(om_519.offload_gate_exps_buffer[i]);
 
@@ -14710,7 +14712,7 @@ void offload_manager_input_process(int layer_id, std::vector<int32_t> argsort_bu
 //judge if hot expert is in vram, if not, read from file and update the map
 void hot_expert_offload_process(int layer_id)
 {   
-    GOOFY_VK_LOG_DEBUG("hot_expert_offload_process");
+    // GOOFY_VK_LOG_DEBUG("hot_expert_offload_process");
     int cur_expert_id;
     int* expert_map = om_519.expert_map[layer_id];
     // int expert_map[256] = om_519.expert_map[layer_id];
@@ -15072,89 +15074,66 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         bool goofy_test_ffn_submit = (find_expected_node(cgraph->nodes[i], target_str)) && (!find_expected_node(cgraph->nodes[i], target_str_no));
         //bool goofy_test_ffn_submit = false;
 
-        std::string gate_str = "ffn_moe_gate-19";
-        bool gate_op_remove = find_expected_node(cgraph->nodes[i], gate_str); //&& (ggml_nelements(cgraph->nodes[i]) == 256);
+        // std::string gate_str = "ffn_moe_gate-19";
+        // bool gate_op_remove_1 = find_expected_node(cgraph->nodes[i], gate_str);// && (ggml_nelements(cgraph->nodes[i]) == 8192)；
+        // gate_str = "ffn_moe_gate-18";
+        // bool gate_op_remove_2 = find_expected_node(cgraph->nodes[i], gate_str);
+
+        std::string gate_str = "ffn_moe_gate-9";
+
+        bool gate_op_remove = (find_expected_node(cgraph->nodes[i], gate_str)) && (om_519.need_offload_test);
 
         bool submit = (submitted_nodes >= nodes_per_submit) ||
                       (mul_mat_bytes_per_submit != 0 && mul_mat_bytes >= mul_mat_bytes_per_submit) ||
                       (i + ctx->num_additional_fused_ops >= last_node) ||
                       (almost_ready && !ctx->almost_ready_fence_pending) || 
-                      (goofy_test_ffn_submit); // ||
-                    //   (gate_op_remove);
+                      (goofy_test_ffn_submit);
 
-        // if(cgraph->nodes[i]->op == GGML_OP_MUL_MAT_ID)
-        if(0)
-        {   
-            // GOOFY_VK_LOG_DEBUG("i=" << i << " submit_node_idx=" << submit_node_idx);
-            target_str = "ffn_moe_gate-";
-            if(find_expected_node(cgraph->nodes[i], target_str))
-            {   
-                ggml_vk_synchronize(ctx);
-                // GOOFY_VK_LOG_DEBUG(ggml_get_name(cgraph->nodes[i]));
-                // GOOFY_VK_LOG_DEBUG(cgraph->nodes[i]->data);
-                // GOOFY_VK_LOG_DEBUG(ggml_get_name(cgraph->nodes[i]->src[0]));
-                // GOOFY_VK_LOG_DEBUG(ggml_nbytes(cgraph->nodes[i]->src[0]) << "bytes");
-                // GOOFY_VK_LOG_DEBUG(cgraph->nodes[i]->src[0]->data);
-                // GOOFY_VK_LOG_DEBUG(" ");
-
-                // cgraph->nodes[i]->src[0]->buffer = offload_buffer_manager.offload_gate_exps_buffer;
-                // cgraph->nodes[i]->src[0]->data = (char *)ggml_backend_buffer_get_base(offload_buffer_manager.gate_tallocr.buffer) + offload_buffer_manager.gate_tallocr.offset;
-                
-                // const std::string ffn_exps_output_dir = "ffn_exps_weights";
-                // std::string output_path = ffn_exps_output_dir + "/" + ggml_get_name(cgraph->nodes[i]->src[0]);
-                // if (std::filesystem::exists(output_path)){
-                //     std::ifstream file(output_path, std::ios::binary);
-                //     std::vector<char> weight_buf(ggml_nbytes(cgraph->nodes[i]->src[0]));
-
-                //     if (!file.read(weight_buf.data(), ggml_nbytes(cgraph->nodes[i]->src[0]))) {
-                //         std::cerr << "Failed to read weight file: " << output_path << std::endl;
-                //     }
-                //     ggml_backend_vk_set_tensor_async(backend, cgraph->nodes[i]->src[0], weight_buf.data(), 0, ggml_nbytes(cgraph->nodes[i]->src[0]));
-                //     ggml_vk_synchronize(ctx);
-
-                //     // GOOFY_VK_LOG_DEBUG(ggml_get_name(cgraph->nodes[i]->src[0]) << " file exist");
-                // }
-            }
-            
-            // target_str = "ffn_moe_up-";
-            // if(find_expected_node(cgraph->nodes[i], target_str))
-            // {
-            //     // GOOFY_VK_LOG_DEBUG(ggml_get_name(cgraph->nodes[i]));
-            //     cgraph->nodes[i]->buffer = offload_buffer_manager.offload_up_exps_buffer;
-            //     cgraph->nodes[i]->data = (char *)ggml_backend_buffer_get_base(offload_buffer_manager.up_tallocr.buffer) + offload_buffer_manager.up_tallocr.offset;
-            //     ggml_backend_vk_buffer_init_tensor(offload_buffer_manager.offload_up_exps_buffer, cgraph->nodes[i]);
-            // }
-
-            // target_str = "ffn_moe_down-";
-            // if(find_expected_node(cgraph->nodes[i], target_str))
-            // {
-            //     // GOOFY_VK_LOG_DEBUG(ggml_get_name(cgraph->nodes[i]));
-            //     cgraph->nodes[i]->buffer = offload_buffer_manager.offload_down_exps_buffer;
-            //     cgraph->nodes[i]->data = (char *)ggml_backend_buffer_get_base(offload_buffer_manager.down_tallocr.buffer) + offload_buffer_manager.down_tallocr.offset;
-            //     ggml_backend_vk_buffer_init_tensor(offload_buffer_manager.offload_down_exps_buffer, cgraph->nodes[i]);
-            // }
-        }
 
         if(gate_op_remove)
         {
-            GOOFY_VK_LOG_DEBUG("gate_rework:" << ggml_get_name(cgraph->nodes[i]));
-            
+            // GOOFY_VK_LOG_DEBUG("gate_rework:" << ggml_get_name(cgraph->nodes[i]));
+            // GOOFY_VK_LOG_DEBUG("nelements" << ggml_nelements(cgraph->nodes[i]));
             //judge if needed expert in vram
-            int layer_id = get_layer_id(cgraph->nodes[i]);
-            hot_expert_offload_process(layer_id);
+            // int layer_id = get_layer_id(cgraph->nodes[i]);
+            // hot_expert_offload_process(layer_id);
 
-            ggml_vk_synchronize(ctx);
-            GOOFY_VK_LOG_DEBUG("write mapped_buffer");
-            for(int i = 0; i < 8; i++)
-            {
-                om_519.topk_buffer[i] = om_519.expert_map[layer_id][om_519.argsort_buffer[i]];
-                // GOOFY_VK_LOG_DEBUG(om_519.topk_buffer[i] << " ");
-            }
-            ggml_backend_vk_set_tensor_async(backend, om_519.mapped_topk_tensor, om_519.topk_buffer, 0, 32);
-            ggml_vk_synchronize(ctx);
+            // ggml_vk_synchronize(ctx);
+            // GOOFY_VK_LOG_DEBUG("write mapped_buffer");
+            // for(int i = 0; i < 8; i++)
+            // {
+            //     om_519.topk_buffer[i] = om_519.expert_map[layer_id][om_519.argsort_buffer[i]];
+            //     // GOOFY_VK_LOG_DEBUG(om_519.topk_buffer[i] << " ");
+            // }
+            // ggml_backend_vk_set_tensor_async(backend, om_519.mapped_topk_tensor, om_519.topk_buffer, 0, 32);
+            // ggml_vk_synchronize(ctx);
 
-            ggml_backend_vk_get_tensor_async(backend, om_519.mapped_topk_tensor, om_519.topk_buffer_test, 0, 32);
-            ggml_vk_synchronize(ctx);
+            // // ggml_backend_vk_get_tensor_async(backend, om_519.mapped_topk_tensor, om_519.topk_buffer_test, 0, 32);
+            // // ggml_vk_synchronize(ctx);
+
+
+            // printf("origin weight ne: [");
+            // for (int j = 0; j < 4; j++) {
+            //     printf("%d ", cgraph->nodes[i]->src[0]->ne[j]);
+            // }
+            // printf("]  type:%d\n", cgraph->nodes[i]->src[0]->type);                    
+
+            // printf("my tensor ne: [");
+            // for (int j = 0; j < 4; j++) {
+            //     printf("%d ", om_519.hot_gate_tensor[9]->ne[j]);
+            // }
+            // printf("]  type:%d\n", om_519.hot_gate_tensor[9]->type);   
+
+            // size_t origin_size = ggml_nbytes(cgraph->nodes[i]->src[0]);
+            // std::vector<char> origin_weight_buf(origin_size);            
+            // ggml_backend_vk_get_tensor_async(backend, cgraph->nodes[i]->src[0], origin_weight_buf.data(), 0, origin_size);
+            
+            // size_t hot_layer_size = ggml_nbytes(om_519.hot_gate_tensor[9]);
+            // std::vector<char> my_weight_buf(hot_layer_size);
+            // ggml_backend_vk_get_tensor_async(backend, om_519.hot_gate_tensor[9], my_weight_buf.data(), 0, hot_layer_size);
+
+            // GOOFY_VK_LOG_DEBUG("origin " << origin_size << "new_layer " << hot_layer_size);
+            // ggml_vk_synchronize(ctx);
 
             // GOOFY_VK_LOG_DEBUG("read mapped_buffer");
             // for(int i = 0; i < 8; i++)
@@ -15162,9 +15141,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             //     GOOFY_VK_LOG_DEBUG(om_519.topk_buffer_test[i] << " ");
             // }
             
-            //we need to change the caculate matrix at here
-            cgraph->nodes[i]->src[0] = om_519.hot_gate_tensor[layer_id];
-            cgraph->nodes[i]->src[2] = om_519.mapped_topk_tensor;            
+            // we need to change the caculate matrix at here
+            // cgraph->nodes[i]->src[0] = om_519.hot_gate_tensor[33];
+            // cgraph->nodes[i]->src[2] = om_519.mapped_topk_tensor;            
         }
 
         bool enqueued = ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx], submit_node_idx, i + ctx->num_additional_fused_ops >= last_node, almost_ready, submit);
@@ -15207,6 +15186,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->fused_ops_write_mask = 0;
 
         if(goofy_test_ffn_submit)
+        // if(0)
         {
             ggml_vk_synchronize(ctx);
 
@@ -15219,8 +15199,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             // GOOFY_VK_LOG_DEBUG(cgraph->nodes[gate_idx]->src[0]->data);
             // GOOFY_VK_LOG_DEBUG(" ");
 
-            cgraph->nodes[gate_idx]->src[0]->buffer = offload_buffer_manager.offload_gate_exps_buffer;
-            cgraph->nodes[gate_idx]->src[0]->data = (char *)ggml_backend_buffer_get_base(offload_buffer_manager.gate_tallocr.buffer) + offload_buffer_manager.gate_tallocr.offset;
+            // cgraph->nodes[gate_idx]->src[0]->buffer = offload_buffer_manager.offload_gate_exps_buffer;
+            // cgraph->nodes[gate_idx]->src[0]->data = (char *)ggml_backend_buffer_get_base(offload_buffer_manager.gate_tallocr.buffer) + offload_buffer_manager.gate_tallocr.offset;
 
             const std::string ffn_exps_output_dir = "ffn_exps_weights";
             int layer_id = get_layer_id(cgraph->nodes[i]);
@@ -15229,22 +15209,6 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             std::string output_path = ffn_exps_output_dir + "/blk." + str +".ffn_gate_exps.weight";
             // std::string output_path = ffn_exps_output_dir + "/" + ggml_get_name(cgraph->nodes[gate_idx]->src[0]);
 
-            if (std::filesystem::exists(output_path)){
-                std::ifstream file(output_path, std::ios::binary);
-                std::vector<char> weight_buf(ggml_nbytes(cgraph->nodes[gate_idx]->src[0]));
-                GOOFY_VK_LOG_DEBUG("read " << output_path);
-
-                if (!file.read(weight_buf.data(), ggml_nbytes(cgraph->nodes[gate_idx]->src[0]))) {
-                    std::cerr << "Failed to read weight file: " << output_path << std::endl;
-                }
-                ggml_backend_vk_set_tensor_async(backend, cgraph->nodes[gate_idx]->src[0], weight_buf.data(), 0, ggml_nbytes(cgraph->nodes[gate_idx]->src[0]));
-                ggml_vk_synchronize(ctx);                 
-            }
-            
-            // size_t weight_size = ggml_nbytes(cgraph->nodes[i]);
-            // size_t weight_elements = ggml_nelements(cgraph->nodes[i]);
-            // std::vector<float> weight_buffer(weight_size / sizeof(float));
-
             size_t topk_size = ggml_nbytes(cgraph->nodes[i-1]);
             size_t topk_elements = ggml_nelements(cgraph->nodes[i-1]);
             std::vector<int32_t> topk_buffer(topk_size / sizeof(int32_t));
@@ -15252,32 +15216,83 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             size_t argsort_size = ggml_nbytes(cgraph->nodes[i-2]);
             size_t argsort_elements = ggml_nelements(cgraph->nodes[i-2]);
 
+            // printf("topk_elements:%lld, argsort_elements:%lld\n", topk_elements, argsort_elements);
+
+            // if(topk_elements != 8)
+            // {
+            //     if (std::filesystem::exists(output_path)){
+            //         std::ifstream file(output_path, std::ios::binary);
+            //         std::vector<char> weight_buf(ggml_nbytes(cgraph->nodes[gate_idx]->src[0]));
+            //         // GOOFY_VK_LOG_DEBUG("read " << output_path);
+
+            //         if (!file.read(weight_buf.data(), ggml_nbytes(cgraph->nodes[gate_idx]->src[0]))) {
+            //             std::cerr << "Failed to read weight file: " << output_path << std::endl;
+            //         }
+            //         ggml_backend_vk_set_tensor_async(backend, cgraph->nodes[gate_idx]->src[0], weight_buf.data(), 0, ggml_nbytes(cgraph->nodes[gate_idx]->src[0]));
+            //         ggml_vk_synchronize(ctx);                 
+            //     }
+            // }
+            
+            size_t weight_size = ggml_nbytes(cgraph->nodes[i]);
+            size_t weight_elements = ggml_nelements(cgraph->nodes[i]);
+            std::vector<float> weight_buffer(weight_size / sizeof(float));
+
+
+
             // size_t probs_size = ggml_nbytes(cgraph->nodes[i-4]);
             // size_t probs_elements = ggml_nelements(cgraph->nodes[i-4]);
             // std::vector<float> probs_buffer(probs_size / sizeof(float));
 
-            // ggml_backend_vk_get_tensor_async(backend, cgraph->nodes[i], weight_buffer.data(), 0, weight_size);
-            // ggml_backend_vk_get_tensor_async(backend, cgraph->nodes[i-1], topk_buffer.data(), 0, topk_size);
+            ggml_backend_vk_get_tensor_async(backend, cgraph->nodes[i], weight_buffer.data(), 0, weight_size);
+            ggml_backend_vk_get_tensor_async(backend, cgraph->nodes[i-1], topk_buffer.data(), 0, topk_size);
             
             // ggml_backend_vk_get_tensor_async(backend, cgraph->nodes[i-4], probs_buffer.data(), 0, probs_size);
             
-
-            if(topk_elements == 8)
+            // if(topk_elements == 8)
+            // if(0)
+            if(1)
             {   
+                GOOFY_VK_LOG_DEBUG("gate_rework:" << ggml_get_name(cgraph->nodes[i]));
+                om_519.need_offload_test = true;
                 ggml_backend_vk_get_tensor_async(backend, cgraph->nodes[i-2], om_519.argsort_buffer, 0, argsort_size);
                 ggml_vk_synchronize(ctx);
-                // int layer_id = get_layer_id(cgraph->nodes[i]);
-                // printf("argsort_buffer: [");
-                // for (int j = 0; j < 256; j++) {
+                
+                // printf("layer:%d sort topk: [", layer_id);
+                // for (int j = 0; j < 8; j++) {
                 //     printf("%d ", om_519.argsort_buffer[j]);
                 // }
-                // printf("]");           
-            }
+                // printf("]\n");           
 
+                // GOOFY_VK_LOG_DEBUG("gate_rework:" << ggml_get_name(cgraph->nodes[i]));
+                // GOOFY_VK_LOG_DEBUG("nelements" << ggml_nelements(cgraph->nodes[i]));
 
-            
-            // ggml_backend_vk_set_tensor_async(backend, cgraph->nodes[i], weight_buffer.data(), 0, weight_size);
-            // ggml_vk_synchronize(ctx);
+                hot_expert_offload_process(layer_id);
+
+                // GOOFY_VK_LOG_DEBUG("write mapped_buffer");
+                for(int i = 0; i < 8; i++)
+                {   
+                    // om_519.topk_buffer[i] = i;
+                    om_519.topk_buffer[i] = om_519.expert_map[layer_id][om_519.argsort_buffer[i]];
+                    // GOOFY_VK_LOG_DEBUG(om_519.topk_buffer[i] << " ");
+                }
+                ggml_backend_vk_set_tensor_async(backend, om_519.mapped_topk_tensor, om_519.topk_buffer, 0, 32);
+                ggml_vk_synchronize(ctx);
+
+                // ggml_backend_vk_get_tensor_async(backend, om_519.mapped_topk_tensor, om_519.topk_buffer_test, 0, 32);
+                // ggml_vk_synchronize(ctx);
+
+                // we need to change the caculate matrix at here
+
+                GOOFY_VK_LOG_DEBUG("before src[0] ne" << cgraph->nodes[gate_idx]->src[0]->ne[0] << cgraph->nodes[gate_idx]->src[0]->ne[1] << cgraph->nodes[gate_idx]->src[0]->ne[2] << cgraph->nodes[gate_idx]->src[0]->ne[3]);
+                GOOFY_VK_LOG_DEBUG("before src[2] ne" << cgraph->nodes[gate_idx]->src[2]->ne[0] << cgraph->nodes[gate_idx]->src[2]->ne[1] << cgraph->nodes[gate_idx]->src[2]->ne[2] << cgraph->nodes[gate_idx]->src[2]->ne[3]);
+
+                cgraph->nodes[gate_idx]->src[0] = om_519.hot_gate_tensor[layer_id];
+                cgraph->nodes[gate_idx]->src[2] = om_519.mapped_topk_tensor; 
+
+                GOOFY_VK_LOG_DEBUG("after src[0] ne" << cgraph->nodes[gate_idx]->src[0]->ne[0] << cgraph->nodes[gate_idx]->src[0]->ne[1] << cgraph->nodes[gate_idx]->src[0]->ne[2] << cgraph->nodes[gate_idx]->src[0]->ne[3]);
+                GOOFY_VK_LOG_DEBUG("after src[2] ne" << cgraph->nodes[gate_idx]->src[2]->ne[0] << cgraph->nodes[gate_idx]->src[2]->ne[1] << cgraph->nodes[gate_idx]->src[2]->ne[2] << cgraph->nodes[gate_idx]->src[2]->ne[3]);
+
+            }     
         }
     }
 

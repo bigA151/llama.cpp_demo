@@ -1202,6 +1202,7 @@ static bool alloc_tensor_range(struct ggml_context * ctx,
         if (t->data == NULL) {
             if (t->view_src == NULL) {
                 if(strstr(ggml_get_name(t), "ffn_gate_exps") == NULL){
+                // if(1){
                     status = ggml_tallocr_alloc(&tallocr, t);
                 }
                 else{
