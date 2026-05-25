@@ -1201,7 +1201,7 @@ static bool alloc_tensor_range(struct ggml_context * ctx,
 
         if (t->data == NULL) {
             if (t->view_src == NULL) {
-                if(strstr(ggml_get_name(t), "ffn_gate_exps") == NULL){
+                if((strstr(ggml_get_name(t), "ffn_gate_exps") == NULL) && (strstr(ggml_get_name(t), "ffn_up_exps") == NULL) && (strstr(ggml_get_name(t), "ffn_down_exps") == NULL)){
                 // if(1){
                     status = ggml_tallocr_alloc(&tallocr, t);
                 }
@@ -1246,7 +1246,8 @@ static ggml_backend_buffer_t ggml_backend_alloc_ctx_tensors_from_buft_impl(
             this_size = GGML_PAD(ggml_backend_buft_get_alloc_size(buft, t), alignment);
         }
 
-        if(strstr(ggml_get_name(t), "ffn_gate_exps") != NULL && strcmp(ggml_get_name(t), "blk.0.ffn_gate_exps.weight")) //goofy
+        // if(strstr(ggml_get_name(t), "ffn_gate_exps") != NULL && strcmp(ggml_get_name(t), "blk.0.ffn_gate_exps.weight")) //goofy
+        if((strstr(ggml_get_name(t), "ffn_gate_exps") != NULL || (strstr(ggml_get_name(t), "ffn_up_exps") != NULL) || (strstr(ggml_get_name(t), "ffn_down_exps") != NULL)) && strcmp(ggml_get_name(t), "blk.0.ffn_down_exps.weight"))
         {   
             GGML_LOG_ERROR("this_size change to 0, %s\n", t->name);
             this_size = 0;
