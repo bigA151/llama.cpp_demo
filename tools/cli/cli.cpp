@@ -342,16 +342,6 @@ static std::vector<std::pair<std::string, size_t>> auto_completion_callback(std:
 
 static constexpr size_t FILE_GLOB_MAX_RESULTS = 100;
 
-typedef struct {
-    bool expert_offload[256][48]; //sim expert offloaded
-    int total_layers;      //
-    int offload_experts;  //total offload experts
-    int offload_layers;    //if need offload in single layer
-    bool layer_hot_inited[48];  //if this layer already have hot experts
-} offload_simulate_t;
-
-extern offload_simulate_t offload_manager;
-
 int main(int argc, char ** argv) {
     common_params params;
 
@@ -642,10 +632,6 @@ int main(int argc, char ** argv) {
             console::log("[ Prompt: %.1f t/s | Generation: %.1f t/s ]\n", timings.prompt_per_second, timings.predicted_per_second);
             console::set_display(DISPLAY_TYPE_RESET);
         }
-
-        console::log("total_layers: %d\n", offload_manager.total_layers);
-        console::log("offload_layers: %d\n", offload_manager.offload_layers);
-        console::log("offload_experts: %d\n", offload_manager.offload_experts);
 
         if (params.single_turn) {
             break;

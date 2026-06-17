@@ -14405,14 +14405,6 @@ static int32_t find_first_set(uint32_t x) {
 }
 
 typedef struct {
-    bool expert_offload[256][48]; //sim expert offloaded
-    int total_layers;      //
-    int offload_experts;  //total offload experts
-    int offload_layers;    //if need offload in single layer
-    bool layer_hot_inited[48];  //if this layer already have hot experts
-} offload_simulate_t;
-
-typedef struct {
     ggml_backend_buffer_t offload_down_exps_buffer;
     ggml_backend_buffer_t offload_up_exps_buffer;
     ggml_backend_buffer_t offload_gate_exps_buffer;
@@ -14702,51 +14694,6 @@ void offload_buffer_manager_519_init(ggml_backend_t backend)
 #ifdef __cplusplus
 }
 #endif
-
-offload_simulate_t offload_manager = {};
-
-void offload_manager_first_input_init(int layer_id, std::vector<int32_t> argsort_buffer, int used_experts)
-{   
-    for(int i = 0; i < used_experts; i++)
-    {
-        offload_manager.expert_offload[argsort_buffer[i]][layer_id] = true;
-    }
-    offload_manager.layer_hot_inited[layer_id] = true;
-    printf("offload_manager layer %d init\n", layer_id);
-}
-
-void offload_manager_input_process(int layer_id, std::vector<int32_t> argsort_buffer, int topk, int used_experts)
-{   
-    int offload_num = 0;
-    // printf("process layer %d\n", layer_id);
-    offload_manager.total_layers++;
-    for(int i = 0; i < topk; i++)
-    {   
-        if(offload_manager.expert_offload[argsort_buffer[i]][layer_id] == false)
-        {   
-            offload_manager.expert_offload[argsort_buffer[i]][layer_id] = true;
-            // printf("layer%d, expert%d offload\n", layer_id, argsort_buffer[i]);
-            offload_num++;
-
-            offload_manager.offload_experts++;
-        }
-    }
-    if(offload_num)
-    {
-        offload_manager.offload_layers++;
-    }
-    int cur = 255;
-    while(offload_num)
-    {
-        if(offload_manager.expert_offload[argsort_buffer[cur]][layer_id] == true)
-        {
-            offload_manager.expert_offload[argsort_buffer[cur]][layer_id] = false;
-            offload_num--;
-            // printf("layer%d, expert%d remove\n", layer_id, argsort_buffer[cur]);
-        }   
-        cur--;
-    }
-}
 
 //judge if hot expert is in vram, if not, read from file and update the map
 void hot_expert_offload_process(int layer_id)
@@ -15206,7 +15153,6 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         if(goofy_test_ffn_submit)
         // if(0)
         {
-            ggml_vk_synchronize(ctx);
 
             //node i : weights   node i+6 : ffn_moe_gate  node:i-2 experts sorted,pick top k
             int gate_idx = i + 6;
@@ -15219,92 +15165,32 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             // GOOFY_VK_LOG_DEBUG(cgraph->nodes[gate_idx]->src[0]->data);
             // GOOFY_VK_LOG_DEBUG(" ");
 
-            // cgraph->nodes[gate_idx]->src[0]->buffer = offload_buffer_manager.offload_gate_exps_buffer;
-            // cgraph->nodes[gate_idx]->src[0]->data = (char *)ggml_backend_buffer_get_base(offload_buffer_manager.gate_tallocr.buffer) + offload_buffer_manager.gate_tallocr.offset;
-
             const std::string ffn_exps_output_dir = "ffn_exps_weights";
             int layer_id = get_layer_id(cgraph->nodes[i]);
-            char str[20];
-            sprintf(str, "%d", layer_id);
-            std::string output_path = ffn_exps_output_dir + "/blk." + str +".ffn_gate_exps.weight";
-            // std::string output_path = ffn_exps_output_dir + "/" + ggml_get_name(cgraph->nodes[gate_idx]->src[0]);
-
-            size_t topk_size = ggml_nbytes(cgraph->nodes[i-1]);
-            size_t topk_elements = ggml_nelements(cgraph->nodes[i-1]);
-            std::vector<int32_t> topk_buffer(topk_size / sizeof(int32_t));
 
             size_t argsort_size = ggml_nbytes(cgraph->nodes[i-2]);
             size_t argsort_elements = ggml_nelements(cgraph->nodes[i-2]);
 
-            // printf("topk_elements:%lld, argsort_elements:%lld\n", topk_elements, argsort_elements);
-
-            // if(topk_elements != 8)
-            // {
-            //     if (std::filesystem::exists(output_path)){
-            //         std::ifstream file(output_path, std::ios::binary);
-            //         std::vector<char> weight_buf(ggml_nbytes(cgraph->nodes[gate_idx]->src[0]));
-            //         // GOOFY_VK_LOG_DEBUG("read " << output_path);
-
-            //         if (!file.read(weight_buf.data(), ggml_nbytes(cgraph->nodes[gate_idx]->src[0]))) {
-            //             std::cerr << "Failed to read weight file: " << output_path << std::endl;
-            //         }
-            //         ggml_backend_vk_set_tensor_async(backend, cgraph->nodes[gate_idx]->src[0], weight_buf.data(), 0, ggml_nbytes(cgraph->nodes[gate_idx]->src[0]));
-            //         ggml_vk_synchronize(ctx);                 
-            //     }
-            // }
-            
-            size_t weight_size = ggml_nbytes(cgraph->nodes[i]);
-            size_t weight_elements = ggml_nelements(cgraph->nodes[i]);
-            std::vector<float> weight_buffer(weight_size / sizeof(float));
-
-
-
-            // size_t probs_size = ggml_nbytes(cgraph->nodes[i-4]);
-            // size_t probs_elements = ggml_nelements(cgraph->nodes[i-4]);
-            // std::vector<float> probs_buffer(probs_size / sizeof(float));
-
-            // ggml_backend_vk_get_tensor_async(backend, cgraph->nodes[i], weight_buffer.data(), 0, weight_size);
-            // ggml_backend_vk_get_tensor_async(backend, cgraph->nodes[i-1], topk_buffer.data(), 0, topk_size);
-            
-            // ggml_backend_vk_get_tensor_async(backend, cgraph->nodes[i-4], probs_buffer.data(), 0, probs_size);
-            
-            // if(topk_elements == 8)
-            // if(0)
             if(1)
             {   
                 // GOOFY_VK_LOG_DEBUG("gate_rework:" << ggml_get_name(cgraph->nodes[i]));
-                // om_519.need_offload_test = true;
                 ggml_backend_vk_get_tensor_async(backend, cgraph->nodes[i-2], om_519.argsort_buffer, 0, argsort_size);
-                ggml_vk_synchronize(ctx);
-                
-                // printf("layer:%d sort topk: [", layer_id);
-                // for (int j = 0; j < 8; j++) {
-                //     printf("%d ", om_519.argsort_buffer[j]);
-                // }
-                // printf("]\n");           
-
-                // GOOFY_VK_LOG_DEBUG("gate_rework:" << ggml_get_name(cgraph->nodes[i]));
-                // GOOFY_VK_LOG_DEBUG("nelements" << ggml_nelements(cgraph->nodes[i]));
+                ggml_vk_synchronize(ctx);                
 
                 hot_expert_offload_process(layer_id);
 
                 // GOOFY_VK_LOG_DEBUG("write mapped_buffer");
                 for(int i = 0; i < 8; i++)
                 {   
-                    // om_519.topk_buffer[i] = i;
                     om_519.topk_buffer[i] = om_519.expert_map[layer_id][om_519.argsort_buffer[i]];
-                    // GOOFY_VK_LOG_DEBUG(om_519.topk_buffer[i] << " ");
                 }
                 ggml_backend_vk_set_tensor_async(backend, om_519.mapped_topk_tensor, om_519.topk_buffer, 0, 32);
                 ggml_vk_synchronize(ctx);
 
-                // ggml_backend_vk_get_tensor_async(backend, om_519.mapped_topk_tensor, om_519.topk_buffer_test, 0, 32);
-                // ggml_vk_synchronize(ctx);
-
                 // we need to change the caculate matrix at here
 
-                GOOFY_VK_LOG_DEBUG("before src[0] ne" << cgraph->nodes[down_idx]->src[0]->ne[0] << cgraph->nodes[down_idx]->src[0]->ne[1] << cgraph->nodes[down_idx]->src[0]->ne[2] << cgraph->nodes[down_idx]->src[0]->ne[3]);
-                GOOFY_VK_LOG_DEBUG("before src[2] ne" << cgraph->nodes[down_idx]->src[2]->ne[0] << cgraph->nodes[down_idx]->src[2]->ne[1] << cgraph->nodes[down_idx]->src[2]->ne[2] << cgraph->nodes[down_idx]->src[2]->ne[3]);
+                // GOOFY_VK_LOG_DEBUG("before src[0] ne" << cgraph->nodes[down_idx]->src[0]->ne[0] << cgraph->nodes[down_idx]->src[0]->ne[1] << cgraph->nodes[down_idx]->src[0]->ne[2] << cgraph->nodes[down_idx]->src[0]->ne[3]);
+                // GOOFY_VK_LOG_DEBUG("before src[2] ne" << cgraph->nodes[down_idx]->src[2]->ne[0] << cgraph->nodes[down_idx]->src[2]->ne[1] << cgraph->nodes[down_idx]->src[2]->ne[2] << cgraph->nodes[down_idx]->src[2]->ne[3]);
 
                 cgraph->nodes[gate_idx]->src[0] = om_519.hot_gate_tensor[layer_id];
                 cgraph->nodes[gate_idx]->src[2] = om_519.mapped_topk_tensor; 
@@ -15313,8 +15199,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 cgraph->nodes[down_idx]->src[0] = om_519.hot_down_tensor[layer_id];
                 cgraph->nodes[down_idx]->src[2] = om_519.mapped_topk_tensor; 
 
-                GOOFY_VK_LOG_DEBUG("after src[0] ne" << cgraph->nodes[down_idx]->src[0]->ne[0] << cgraph->nodes[down_idx]->src[0]->ne[1] << cgraph->nodes[down_idx]->src[0]->ne[2] << cgraph->nodes[down_idx]->src[0]->ne[3]);
-                GOOFY_VK_LOG_DEBUG("after src[2] ne" << cgraph->nodes[down_idx]->src[2]->ne[0] << cgraph->nodes[down_idx]->src[2]->ne[1] << cgraph->nodes[down_idx]->src[2]->ne[2] << cgraph->nodes[down_idx]->src[2]->ne[3]);
+                // GOOFY_VK_LOG_DEBUG("after src[0] ne" << cgraph->nodes[down_idx]->src[0]->ne[0] << cgraph->nodes[down_idx]->src[0]->ne[1] << cgraph->nodes[down_idx]->src[0]->ne[2] << cgraph->nodes[down_idx]->src[0]->ne[3]);
+                // GOOFY_VK_LOG_DEBUG("after src[2] ne" << cgraph->nodes[down_idx]->src[2]->ne[0] << cgraph->nodes[down_idx]->src[2]->ne[1] << cgraph->nodes[down_idx]->src[2]->ne[2] << cgraph->nodes[down_idx]->src[2]->ne[3]);
 
             }     
         }

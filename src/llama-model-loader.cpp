@@ -1526,37 +1526,37 @@ bool llama_model_loader::load_all_data(
             continue;
         }
 
-        // const std::string tensor_name = ggml_get_name(cur);
-        // bool is_ffn_exps_weight = (tensor_name.find(".ffn_down_exps.weight") != std::string::npos ||
-        //                            tensor_name.find(".ffn_gate_exps.weight") != std::string::npos ||
-        //                            tensor_name.find(".ffn_up_exps.weight") != std::string::npos);
+        const std::string tensor_name = ggml_get_name(cur);
+        bool is_ffn_exps_weight = (tensor_name.find(".ffn_down_exps.weight") != std::string::npos ||
+                                   tensor_name.find(".ffn_gate_exps.weight") != std::string::npos ||
+                                   tensor_name.find(".ffn_up_exps.weight") != std::string::npos);
 
-        // if (is_ffn_exps_weight) {
-        //     // Write tensor data to separate file for this weight (per layer)
-        //     std::string output_path = ffn_exps_output_dir + "/" + tensor_name;
-        //     if (std::filesystem::exists(output_path)){
-        //         LLAMA_LOG_INFO("%s already existed, skip\n", tensor_name.c_str());
-        //         continue;
-        //     }
-        //     std::ofstream outfile(output_path, std::ios::binary);
-        //     if (outfile.is_open()) {
-        //         if (use_mmap) {
-        //             const auto & mapping = mappings.at(weight->idx);
-        //             uint8_t * data = (uint8_t *) mapping->addr() + weight->offs;
-        //             outfile.write(reinterpret_cast<char*>(data), ggml_nbytes(cur));
-        //         } else {
-        //             const auto & file = files.at(weight->idx);
-        //             file->seek(weight->offs, SEEK_SET);
-        //             std::vector<uint8_t> read_buf(ggml_nbytes(cur));
-        //             file->read_raw(read_buf.data(), ggml_nbytes(cur));
-        //             outfile.write(reinterpret_cast<char*>(read_buf.data()), ggml_nbytes(cur));
-        //         }
-        //         outfile.close();
-        //         LLAMA_LOG_INFO("Saved %s to %s\n", tensor_name.c_str(), output_path.c_str());
-        //     } else {
-        //         LLAMA_LOG_WARN("Failed to open file for writing: %s\n", output_path.c_str());
-        //     }
-        // }
+        if (is_ffn_exps_weight) {
+            // Write tensor data to separate file for this weight (per layer)
+            std::string output_path = ffn_exps_output_dir + "/" + tensor_name;
+            if (std::filesystem::exists(output_path)){
+                LLAMA_LOG_INFO("%s already existed, skip\n", tensor_name.c_str());
+                continue;
+            }
+            std::ofstream outfile(output_path, std::ios::binary);
+            if (outfile.is_open()) {
+                if (use_mmap) {
+                    const auto & mapping = mappings.at(weight->idx);
+                    uint8_t * data = (uint8_t *) mapping->addr() + weight->offs;
+                    outfile.write(reinterpret_cast<char*>(data), ggml_nbytes(cur));
+                } else {
+                    const auto & file = files.at(weight->idx);
+                    file->seek(weight->offs, SEEK_SET);
+                    std::vector<uint8_t> read_buf(ggml_nbytes(cur));
+                    file->read_raw(read_buf.data(), ggml_nbytes(cur));
+                    outfile.write(reinterpret_cast<char*>(read_buf.data()), ggml_nbytes(cur));
+                }
+                outfile.close();
+                LLAMA_LOG_INFO("Saved %s to %s\n", tensor_name.c_str(), output_path.c_str());
+            } else {
+                LLAMA_LOG_WARN("Failed to open file for writing: %s\n", output_path.c_str());
+            }
+        }
 
 
         if (progress_callback) {
