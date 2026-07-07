@@ -18,6 +18,39 @@ struct llama_cparams;
 struct llama_ubatch;
 struct llama_model_loader;
 
+enum class llama_ssd_expert_tensor_kind {
+    gate,
+    up,
+    down,
+    gate_up,
+    gate_scale,
+    up_scale,
+    down_scale,
+    gate_input_scale,
+    up_input_scale,
+    down_input_scale,
+    gate_bias,
+    up_bias,
+    down_bias,
+    gate_up_bias,
+};
+
+struct llama_ssd_expert_addr {
+    uint32_t layer;
+    uint32_t expert;
+    llama_ssd_expert_tensor_kind kind;
+
+    uint16_t file_idx;
+    size_t file_offset;
+    size_t n_bytes;
+
+    enum ggml_type type;
+    int64_t ne[GGML_MAX_DIMS];
+    size_t nb[GGML_MAX_DIMS];
+
+    std::string tensor_name;
+};
+
 // available models
 enum llm_type {
     LLM_TYPE_UNKNOWN,
@@ -603,6 +636,9 @@ struct llama_model {
     llama_split_mode split_mode() const;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
+
+    void build_ssd_expert_addrs(const llama_model_loader & ml);
+    const std::vector<llama_ssd_expert_addr> & ssd_expert_addrs() const;
 
     // total number of parameters in the model
     uint64_t n_elements() const;

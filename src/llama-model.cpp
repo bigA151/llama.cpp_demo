@@ -24,6 +24,8 @@
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
+#include <cinttypes>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <cmath>
@@ -664,8 +666,80 @@ struct llama_model::impl {
     layer_dev dev_output = {};
     std::vector<layer_dev> dev_layer;
 
+    std::vector<llama_ssd_expert_addr> ssd_expert_addrs;
+
     bool has_tensor_overrides;
 };
+
+static const char * llama_ssd_expert_tensor_kind_name(llama_ssd_expert_tensor_kind kind) {
+    switch (kind) {
+        case llama_ssd_expert_tensor_kind::gate:             return "gate";
+        case llama_ssd_expert_tensor_kind::up:               return "up";
+        case llama_ssd_expert_tensor_kind::down:             return "down";
+        case llama_ssd_expert_tensor_kind::gate_up:          return "gate_up";
+        case llama_ssd_expert_tensor_kind::gate_scale:       return "gate_scale";
+        case llama_ssd_expert_tensor_kind::up_scale:         return "up_scale";
+        case llama_ssd_expert_tensor_kind::down_scale:       return "down_scale";
+        case llama_ssd_expert_tensor_kind::gate_input_scale: return "gate_input_scale";
+        case llama_ssd_expert_tensor_kind::up_input_scale:   return "up_input_scale";
+        case llama_ssd_expert_tensor_kind::down_input_scale: return "down_input_scale";
+        case llama_ssd_expert_tensor_kind::gate_bias:        return "gate_bias";
+        case llama_ssd_expert_tensor_kind::up_bias:          return "up_bias";
+        case llama_ssd_expert_tensor_kind::down_bias:        return "down_bias";
+        case llama_ssd_expert_tensor_kind::gate_up_bias:     return "gate_up_bias";
+    }
+
+    return "unknown";
+}
+
+static bool llama_is_ssd_expert_arch(llm_arch arch) {
+    return arch == LLM_ARCH_QWEN35MOE;
+}
+
+static bool llama_ssd_expert_tensor_match(
+        const std::string & name,
+        uint32_t & layer,
+        llama_ssd_expert_tensor_kind & kind) {
+    unsigned il = 0;
+    char base[32] = {};
+    char suffix[32] = {};
+    char tail = 0;
+
+    if (sscanf(name.c_str(), "blk.%u.%31[^.].%31[^.]%c", &il, base, suffix, &tail) != 3) {
+        return false;
+    }
+
+    auto set_kind = [&](const char * b, const char * s, llama_ssd_expert_tensor_kind k) {
+        if (strcmp(base, b) == 0 && strcmp(suffix, s) == 0) {
+            layer = il;
+            kind = k;
+            return true;
+        }
+        return false;
+    };
+
+    return set_kind("ffn_gate_exps",    "weight",      llama_ssd_expert_tensor_kind::gate)             ||
+           set_kind("ffn_up_exps",      "weight",      llama_ssd_expert_tensor_kind::up)               ||
+           set_kind("ffn_down_exps",    "weight",      llama_ssd_expert_tensor_kind::down)             ||
+           set_kind("ffn_gate_up_exps", "weight",      llama_ssd_expert_tensor_kind::gate_up)          ||
+           set_kind("ffn_gate_exps",    "scale",       llama_ssd_expert_tensor_kind::gate_scale)       ||
+           set_kind("ffn_up_exps",      "scale",       llama_ssd_expert_tensor_kind::up_scale)         ||
+           set_kind("ffn_down_exps",    "scale",       llama_ssd_expert_tensor_kind::down_scale)       ||
+           set_kind("ffn_gate_exps",    "input_scale", llama_ssd_expert_tensor_kind::gate_input_scale) ||
+           set_kind("ffn_up_exps",      "input_scale", llama_ssd_expert_tensor_kind::up_input_scale)   ||
+           set_kind("ffn_down_exps",    "input_scale", llama_ssd_expert_tensor_kind::down_input_scale) ||
+           set_kind("ffn_gate_exps",    "bias",        llama_ssd_expert_tensor_kind::gate_bias)        ||
+           set_kind("ffn_up_exps",      "bias",        llama_ssd_expert_tensor_kind::up_bias)          ||
+           set_kind("ffn_down_exps",    "bias",        llama_ssd_expert_tensor_kind::down_bias)        ||
+           set_kind("ffn_gate_up_exps", "bias",        llama_ssd_expert_tensor_kind::gate_up_bias);
+}
+
+static bool llama_ssd_expert_tensor_kind_is_weight(llama_ssd_expert_tensor_kind kind) {
+    return kind == llama_ssd_expert_tensor_kind::gate    ||
+           kind == llama_ssd_expert_tensor_kind::up      ||
+           kind == llama_ssd_expert_tensor_kind::down    ||
+           kind == llama_ssd_expert_tensor_kind::gate_up;
+}
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
     pimpl->has_tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
@@ -2939,6 +3013,8 @@ void llama_model::load_hparams(llama_model_loader & ml) {
             } break;
         default: throw std::runtime_error("unsupported model architecture: " + arch_name());
     }
+
+    build_ssd_expert_addrs(ml);
 
     pimpl->n_bytes = ml.n_bytes;
 
@@ -8312,6 +8388,142 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() con
         }
     }
     return ret;
+}
+
+void llama_model::build_ssd_expert_addrs(const llama_model_loader & ml) {
+    pimpl->ssd_expert_addrs.clear();
+
+    if (!llama_is_ssd_expert_arch(arch) || hparams.n_expert == 0) {
+        return;
+    }
+
+    std::map<uint32_t, std::map<llama_ssd_expert_tensor_kind, uint32_t>> counts_by_layer;
+
+    for (const auto & it : ml.weights_map) {
+        uint32_t layer = 0;
+        llama_ssd_expert_tensor_kind kind = llama_ssd_expert_tensor_kind::gate;
+        if (!llama_ssd_expert_tensor_match(it.first, layer, kind)) {
+            continue;
+        }
+
+        const auto & w = it.second;
+        const ggml_tensor * tensor = w.tensor;
+
+        int expert_dim = -1;
+        const int64_t n_expert = hparams.n_expert;
+        if (tensor->ne[2] == n_expert) {
+            expert_dim = 2;
+        } else if (tensor->ne[1] == n_expert) {
+            expert_dim = 1;
+        } else if (tensor->ne[0] == n_expert) {
+            expert_dim = 0;
+        }
+        if (expert_dim < 0) {
+            throw std::runtime_error(format(
+                "%s: tensor '%s' does not have expected expert dimension %u",
+                __func__, it.first.c_str(), hparams.n_expert));
+        }
+        if (llama_ssd_expert_tensor_kind_is_weight(kind) && expert_dim != 2) {
+            throw std::runtime_error(format(
+                "%s: tensor '%s' has expert dimension %d, expected 2 for Qwen3.5MoE routed expert weights",
+                __func__, it.first.c_str(), expert_dim));
+        }
+
+        const size_t expert_nbytes = tensor->nb[expert_dim];
+        const size_t tensor_nbytes = ggml_nbytes(tensor);
+        if (expert_nbytes == 0) {
+            throw std::runtime_error(format("%s: tensor '%s' has zero expert stride", __func__, it.first.c_str()));
+        }
+
+        size_t prev_offset = 0;
+        for (uint32_t expert = 0; expert < hparams.n_expert; ++expert) {
+            const size_t expert_offset = w.offs + expert * expert_nbytes;
+            if (expert > 0 && expert_offset <= prev_offset) {
+                throw std::runtime_error(format(
+                    "%s: tensor '%s' expert %u offset is not monotonically increasing",
+                    __func__, it.first.c_str(), expert));
+            }
+            if (expert_offset < w.offs || expert_offset + expert_nbytes < expert_offset || expert_offset + expert_nbytes > w.offs + tensor_nbytes) {
+                throw std::runtime_error(format(
+                    "%s: tensor '%s' expert %u slice is outside tensor data bounds",
+                    __func__, it.first.c_str(), expert));
+            }
+            prev_offset = expert_offset;
+
+            llama_ssd_expert_addr addr = {};
+            addr.layer       = layer;
+            addr.expert      = expert;
+            addr.kind        = kind;
+            addr.file_idx    = w.idx;
+            addr.file_offset = expert_offset;
+            addr.n_bytes     = expert_nbytes;
+            addr.type        = tensor->type;
+            addr.tensor_name = it.first;
+
+            for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+                addr.ne[i] = tensor->ne[i];
+                addr.nb[i] = tensor->nb[i];
+            }
+
+            pimpl->ssd_expert_addrs.push_back(addr);
+        }
+
+        counts_by_layer[layer][kind] += hparams.n_expert;
+    }
+
+    if (pimpl->ssd_expert_addrs.empty()) {
+        return;
+    }
+
+    for (const auto & layer_counts : counts_by_layer) {
+        const auto & counts = layer_counts.second;
+        const auto has_kind = [&](llama_ssd_expert_tensor_kind kind) {
+            auto it = counts.find(kind);
+            return it != counts.end() && it->second == hparams.n_expert;
+        };
+        const bool has_merged   = has_kind(llama_ssd_expert_tensor_kind::down) && has_kind(llama_ssd_expert_tensor_kind::gate_up);
+        const bool has_fallback = has_kind(llama_ssd_expert_tensor_kind::down) &&
+                                  has_kind(llama_ssd_expert_tensor_kind::gate) &&
+                                  has_kind(llama_ssd_expert_tensor_kind::up);
+        if (!has_merged && !has_fallback) {
+            throw std::runtime_error(format(
+                "%s: layer %u does not have complete Qwen3.5MoE SSD expert mapping (expected down+gate_up or down+gate+up)",
+                __func__, layer_counts.first));
+        }
+    }
+
+    const bool dump = getenv("LLAMA_SSD_EXPERT_DUMP") != nullptr;
+    LLAMA_LOG_INFO("%s: built %zu SSD expert tensor slices for %zu Qwen3.5MoE layers (%u experts/layer)\n",
+            __func__, pimpl->ssd_expert_addrs.size(), counts_by_layer.size(), hparams.n_expert);
+
+    for (const auto & layer_counts : counts_by_layer) {
+        std::stringstream ss;
+        bool first = true;
+        for (const auto & kind_counts : layer_counts.second) {
+            if (!first) {
+                ss << ", ";
+            }
+            ss << llama_ssd_expert_tensor_kind_name(kind_counts.first) << "=" << kind_counts.second;
+            first = false;
+        }
+        LLAMA_LOG_INFO("%s: layer %u SSD expert slices: %s\n", __func__, layer_counts.first, ss.str().c_str());
+    }
+
+    if (dump) {
+        for (const auto & addr : pimpl->ssd_expert_addrs) {
+            LLAMA_LOG_INFO(
+                "%s: slice layer=%u expert=%u kind=%s file=%u offset=%zu n_bytes=%zu type=%s ne=[%" PRId64 ", %" PRId64 ", %" PRId64 ", %" PRId64 "] nb=[%zu, %zu, %zu, %zu] tensor=%s\n",
+                __func__, addr.layer, addr.expert, llama_ssd_expert_tensor_kind_name(addr.kind),
+                addr.file_idx, addr.file_offset, addr.n_bytes, ggml_type_name(addr.type),
+                addr.ne[0], addr.ne[1], addr.ne[2], addr.ne[3],
+                addr.nb[0], addr.nb[1], addr.nb[2], addr.nb[3],
+                addr.tensor_name.c_str());
+        }
+    }
+}
+
+const std::vector<llama_ssd_expert_addr> & llama_model::ssd_expert_addrs() const {
+    return pimpl->ssd_expert_addrs;
 }
 
 uint64_t llama_model::n_elements() const {
