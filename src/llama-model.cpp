@@ -647,6 +647,9 @@ struct llama_model::impl {
     // model memory mapped files
     llama_mmaps mappings;
 
+    // model files kept open for SSD expert slice reads
+    llama_files files;
+
     // objects representing data potentially being locked in memory
     llama_mlocks mlock_bufs;
     llama_mlocks mlock_mmaps;
@@ -8332,6 +8335,8 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    pimpl->files = std::move(ml.files);
+
     return true;
 }
 
@@ -8456,6 +8461,7 @@ void llama_model::build_ssd_expert_addrs(const llama_model_loader & ml) {
             addr.kind        = kind;
             addr.file_idx    = w.idx;
             addr.file_offset = expert_offset;
+            addr.tensor_offset = expert * expert_nbytes;
             addr.n_bytes     = expert_nbytes;
             addr.type        = tensor->type;
             addr.tensor_name = it.first;
@@ -8524,6 +8530,31 @@ void llama_model::build_ssd_expert_addrs(const llama_model_loader & ml) {
 
 const std::vector<llama_ssd_expert_addr> & llama_model::ssd_expert_addrs() const {
     return pimpl->ssd_expert_addrs;
+}
+
+void llama_model::ssd_expert_data(const llama_ssd_expert_addr & addr, void * dst, size_t n_bytes) const {
+    if (n_bytes != addr.n_bytes) {
+        throw std::runtime_error(format(
+            "%s: expert slice layer=%u expert=%u expected n_bytes=%zu, got %zu",
+            __func__, addr.layer, addr.expert, addr.n_bytes, n_bytes));
+    }
+
+    if (addr.file_idx >= pimpl->files.size()) {
+        throw std::runtime_error(format(
+            "%s: expert slice file index %u is outside file count %zu",
+            __func__, addr.file_idx, pimpl->files.size()));
+    }
+
+    const auto & file = pimpl->files.at(addr.file_idx);
+    const size_t file_size = file->size();
+    if (addr.file_offset > file_size || n_bytes > file_size - addr.file_offset) {
+        throw std::runtime_error(format(
+            "%s: expert slice layer=%u expert=%u file=%u offset=%zu n_bytes=%zu is outside file size %zu",
+            __func__, addr.layer, addr.expert, addr.file_idx, addr.file_offset, n_bytes, file_size));
+    }
+
+    file->seek(addr.file_offset, SEEK_SET);
+    file->read_raw(dst, n_bytes);
 }
 
 uint64_t llama_model::n_elements() const {

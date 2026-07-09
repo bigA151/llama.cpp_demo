@@ -43,9 +43,6 @@ DispatchLoaderDynamic & ggml_vk_default_dispatcher();
 #include <future>
 #include <thread>
 
-#include <filesystem>
-#include <fstream>
-
 #if defined(_MSC_VER)
 # define NOMINMAX 1
 # include <windows.h>
@@ -1948,6 +1945,8 @@ struct ggml_backend_vk_context {
     std::vector<int> query_node_idx;
     int32_t num_queries {};
     int32_t query_idx {};
+
+    ggml_vk_ssd_expert_provider ssd_expert_provider {};
 };
 
 static void * const vk_ptr_base = (void *)(uintptr_t) 0x1000;  // NOLINT
@@ -14528,6 +14527,40 @@ typedef struct {
 
 offload_buffer_manager_new_t om_519 = {};
 
+static bool offload_expert_load_slice(
+        int layer_id,
+        int expert_id,
+        int kind,
+        ggml_tensor * tensor,
+        size_t tensor_offset,
+        size_t n_bytes,
+        const char * kind_name) {
+    if (om_519.backend == nullptr || !ggml_backend_is_vk(om_519.backend)) {
+        std::cerr << "SSD expert provider is unavailable: Vulkan backend is not initialized" << std::endl;
+        return false;
+    }
+
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) om_519.backend->context;
+    const ggml_vk_ssd_expert_provider & provider = ctx->ssd_expert_provider;
+    if (provider.read == nullptr) {
+        std::cerr << "SSD expert provider is not registered" << std::endl;
+        return false;
+    }
+
+    std::vector<char> weight_buf(n_bytes);
+    if (!provider.read(provider.user_data, layer_id, expert_id, kind, weight_buf.data(), n_bytes)) {
+        std::cerr << "Failed to read SSD expert slice: layer=" << layer_id
+                  << " expert=" << expert_id
+                  << " kind=" << kind_name
+                  << " n_bytes=" << n_bytes << std::endl;
+        return false;
+    }
+
+    ggml_backend_vk_set_tensor_async(om_519.backend, tensor, weight_buf.data(), tensor_offset, n_bytes);
+    ggml_vk_synchronize(ctx);
+    return true;
+}
+
 //we need a ctx to create tensor to save offload experts
 void offload_expert_ctx_init(void)
 {   
@@ -14585,62 +14618,14 @@ void offload_expert_and_map_init(void)
                 om_519.expert_map[i][j] = EXPERT_NOT_LOADED;
             }                                    
         }
-        char str[20];
-        sprintf(str, "%d", i);
-
-        const std::string ffn_exps_output_dir = "ffn_exps_weights";
-
-        //temp only gate, add up down later
-        std::string output_path = ffn_exps_output_dir + "/blk." + str + ".ffn_gate_exps.weight";
-        if (std::filesystem::exists(output_path)){
-            std::ifstream file(output_path, std::ios::binary);
-            std::vector<char> weight_buf(om_519.gate_alloc_size);
-            GOOFY_VK_LOG_DEBUG("read " << output_path);
-
-            if (!file.read(weight_buf.data(), om_519.gate_alloc_size)) {
-                std::cerr << "Failed to read weight file: " << output_path << std::endl;
-            }
-            //load to vulkan buffer
-            ggml_backend_vk_set_tensor_async(om_519.backend, om_519.hot_gate_tensor[i], weight_buf.data(), 0, om_519.gate_alloc_size);
-            ggml_vk_synchronize((ggml_backend_vk_context*)om_519.backend->context);                 
+        for (int expert = 0; expert < om_519.n_hot_expert; ++expert) {
+            offload_expert_load_slice(i, expert, GGML_VK_SSD_EXPERT_GATE,
+                    om_519.hot_gate_tensor[i], om_519.gate_size_single * expert, om_519.gate_size_single, "gate");
+            offload_expert_load_slice(i, expert, GGML_VK_SSD_EXPERT_UP,
+                    om_519.hot_up_tensor[i], om_519.up_size_single * expert, om_519.up_size_single, "up");
+            offload_expert_load_slice(i, expert, GGML_VK_SSD_EXPERT_DOWN,
+                    om_519.hot_down_tensor[i], om_519.down_size_single * expert, om_519.down_size_single, "down");
         }
-        else {
-            GOOFY_VK_LOG_DEBUG("not found " << output_path);
-        }
-        
-        output_path = ffn_exps_output_dir + "/blk." + str + ".ffn_up_exps.weight";
-        if (std::filesystem::exists(output_path)){
-            std::ifstream file(output_path, std::ios::binary);
-            std::vector<char> weight_buf(om_519.up_alloc_size);
-            GOOFY_VK_LOG_DEBUG("read " << output_path);
-
-            if (!file.read(weight_buf.data(), om_519.up_alloc_size)) {
-                std::cerr << "Failed to read weight file: " << output_path << std::endl;
-            }
-            //load to vulkan buffer
-            ggml_backend_vk_set_tensor_async(om_519.backend, om_519.hot_up_tensor[i], weight_buf.data(), 0, om_519.up_alloc_size);
-            ggml_vk_synchronize((ggml_backend_vk_context*)om_519.backend->context);                 
-        }
-        else {
-            GOOFY_VK_LOG_DEBUG("not found " << output_path);
-        }      
-
-        output_path = ffn_exps_output_dir + "/blk." + str + ".ffn_down_exps.weight";
-        if (std::filesystem::exists(output_path)){
-            std::ifstream file(output_path, std::ios::binary);
-            std::vector<char> weight_buf(om_519.down_alloc_size);
-            GOOFY_VK_LOG_DEBUG("read " << output_path);
-
-            if (!file.read(weight_buf.data(), om_519.down_alloc_size)) {
-                std::cerr << "Failed to read weight file: " << output_path << std::endl;
-            }
-            //load to vulkan buffer
-            ggml_backend_vk_set_tensor_async(om_519.backend, om_519.hot_down_tensor[i], weight_buf.data(), 0, om_519.down_alloc_size);
-            ggml_vk_synchronize((ggml_backend_vk_context*)om_519.backend->context);                 
-        }
-        else {
-            GOOFY_VK_LOG_DEBUG("not found " << output_path);
-        }      
     }   
 }
 
@@ -14721,81 +14706,12 @@ void hot_expert_offload_process(int layer_id)
             GOOFY_VK_LOG_DEBUG("layer:" << layer_id << " load " << cur_expert_id << " at " << expert_map[cur_expert_id] << " remove " << expert_rm_idx);
 
 
-            //load needed tensors from file
-            char str[20];
-            sprintf(str, "%d", layer_id);
-
-            const std::string ffn_exps_output_dir = "ffn_exps_weights";
-
-            //temp only gate, add up down later
-            std::string output_path = ffn_exps_output_dir + "/blk." + str + ".ffn_gate_exps.weight";
-            if (std::filesystem::exists(output_path)){
-                std::ifstream file(output_path, std::ios::binary);
-                std::vector<char> weight_buf(om_519.gate_size_single);
-                GOOFY_VK_LOG_DEBUG("read " << output_path);
-
-                if(file)
-                {
-                    std::streampos offset = cur_expert_id * om_519.gate_size_single;
-                    file.seekg(offset);
-                }
-
-                if (!file.read(weight_buf.data(), om_519.gate_size_single)) {
-                    std::cerr << "Failed to read weight file: " << output_path << std::endl;
-                }
-                //load this single expert to vulkan buffer
-                ggml_backend_vk_set_tensor_async(om_519.backend, om_519.hot_gate_tensor[layer_id], weight_buf.data(), om_519.gate_size_single * expert_map[cur_expert_id], om_519.gate_size_single);
-                ggml_vk_synchronize((ggml_backend_vk_context*)om_519.backend->context);                 
-            }
-            else {
-                GOOFY_VK_LOG_DEBUG("not found " << output_path);
-            } 
-
-            output_path = ffn_exps_output_dir + "/blk." + str + ".ffn_up_exps.weight";
-            if (std::filesystem::exists(output_path)){
-                std::ifstream file(output_path, std::ios::binary);
-                std::vector<char> weight_buf(om_519.up_size_single);
-                GOOFY_VK_LOG_DEBUG("read " << output_path);
-
-                if(file)
-                {
-                    std::streampos offset = cur_expert_id * om_519.up_size_single;
-                    file.seekg(offset);
-                }
-
-                if (!file.read(weight_buf.data(), om_519.up_size_single)) {
-                    std::cerr << "Failed to read weight file: " << output_path << std::endl;
-                }
-                //load this single expert to vulkan buffer
-                ggml_backend_vk_set_tensor_async(om_519.backend, om_519.hot_up_tensor[layer_id], weight_buf.data(), om_519.up_size_single * expert_map[cur_expert_id], om_519.up_size_single);
-                ggml_vk_synchronize((ggml_backend_vk_context*)om_519.backend->context);                 
-            }
-            else {
-                GOOFY_VK_LOG_DEBUG("not found " << output_path);
-            } 
-
-            output_path = ffn_exps_output_dir + "/blk." + str + ".ffn_down_exps.weight";
-            if (std::filesystem::exists(output_path)){
-                std::ifstream file(output_path, std::ios::binary);
-                std::vector<char> weight_buf(om_519.down_size_single);
-                GOOFY_VK_LOG_DEBUG("read " << output_path);
-
-                if(file)
-                {
-                    std::streampos offset = cur_expert_id * om_519.down_size_single;
-                    file.seekg(offset);
-                }
-
-                if (!file.read(weight_buf.data(), om_519.down_size_single)) {
-                    std::cerr << "Failed to read weight file: " << output_path << std::endl;
-                }
-                //load this single expert to vulkan buffer
-                ggml_backend_vk_set_tensor_async(om_519.backend, om_519.hot_down_tensor[layer_id], weight_buf.data(), om_519.down_size_single * expert_map[cur_expert_id], om_519.down_size_single);
-                ggml_vk_synchronize((ggml_backend_vk_context*)om_519.backend->context);                 
-            }
-            else {
-                GOOFY_VK_LOG_DEBUG("not found " << output_path);
-            } 
+            offload_expert_load_slice(layer_id, cur_expert_id, GGML_VK_SSD_EXPERT_GATE,
+                    om_519.hot_gate_tensor[layer_id], om_519.gate_size_single * expert_map[cur_expert_id], om_519.gate_size_single, "gate");
+            offload_expert_load_slice(layer_id, cur_expert_id, GGML_VK_SSD_EXPERT_UP,
+                    om_519.hot_up_tensor[layer_id], om_519.up_size_single * expert_map[cur_expert_id], om_519.up_size_single, "up");
+            offload_expert_load_slice(layer_id, cur_expert_id, GGML_VK_SSD_EXPERT_DOWN,
+                    om_519.hot_down_tensor[layer_id], om_519.down_size_single * expert_map[cur_expert_id], om_519.down_size_single, "down");
 
         }
         else
@@ -15165,11 +15081,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             // GOOFY_VK_LOG_DEBUG(cgraph->nodes[gate_idx]->src[0]->data);
             // GOOFY_VK_LOG_DEBUG(" ");
 
-            const std::string ffn_exps_output_dir = "ffn_exps_weights";
             int layer_id = get_layer_id(cgraph->nodes[i]);
 
             size_t argsort_size = ggml_nbytes(cgraph->nodes[i-2]);
-            size_t argsort_elements = ggml_nelements(cgraph->nodes[i-2]);
 
             if(1)
             {   
@@ -15597,6 +15511,17 @@ ggml_backend_t ggml_backend_vk_init(size_t dev_num) {
 
 bool ggml_backend_is_vk(ggml_backend_t backend) {
     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_vk_guid());
+}
+
+void ggml_backend_vk_set_ssd_expert_provider(
+        ggml_backend_t backend,
+        const struct ggml_vk_ssd_expert_provider * provider) {
+    if (!ggml_backend_is_vk(backend)) {
+        return;
+    }
+
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
+    ctx->ssd_expert_provider = provider ? *provider : ggml_vk_ssd_expert_provider {};
 }
 
 int ggml_backend_vk_get_device_count() {

@@ -42,6 +42,7 @@ struct llama_ssd_expert_addr {
 
     uint16_t file_idx;
     size_t file_offset;
+    size_t tensor_offset;
     size_t n_bytes;
 
     enum ggml_type type;
@@ -639,6 +640,7 @@ struct llama_model {
 
     void build_ssd_expert_addrs(const llama_model_loader & ml);
     const std::vector<llama_ssd_expert_addr> & ssd_expert_addrs() const;
+    void ssd_expert_data(const llama_ssd_expert_addr & addr, void * dst, size_t n_bytes) const;
 
     // total number of parameters in the model
     uint64_t n_elements() const;

@@ -11,6 +11,10 @@
 #include "llama-ext.h"
 #include "llama.h"
 
+#ifdef GGML_USE_VULKAN
+#include "ggml-vulkan.h"
+#endif
+
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -20,6 +24,53 @@
 //
 // llama_context
 //
+
+#ifdef GGML_USE_VULKAN
+static bool llama_vk_ssd_expert_read(
+        void * user_data,
+        int    layer,
+        int    expert,
+        int    kind,
+        void * dst,
+        size_t n_bytes) {
+    const llama_model * model = static_cast<const llama_model *>(user_data);
+    if (model == nullptr) {
+        return false;
+    }
+
+    const llama_ssd_expert_tensor_kind wanted_kind = static_cast<llama_ssd_expert_tensor_kind>(kind);
+    for (const auto & addr : model->ssd_expert_addrs()) {
+        if ((int) addr.layer != layer || (int) addr.expert != expert || addr.kind != wanted_kind) {
+            continue;
+        }
+
+        try {
+            model->ssd_expert_data(addr, dst, n_bytes);
+            return true;
+        } catch (const std::exception & err) {
+            LLAMA_LOG_ERROR("%s: failed to read SSD expert slice layer=%d expert=%d kind=%d n_bytes=%zu: %s\n",
+                    __func__, layer, expert, kind, n_bytes, err.what());
+            return false;
+        }
+    }
+
+    LLAMA_LOG_ERROR("%s: missing SSD expert slice layer=%d expert=%d kind=%d n_bytes=%zu\n",
+            __func__, layer, expert, kind, n_bytes);
+    return false;
+}
+
+static void llama_vk_register_ssd_expert_provider(const llama_model & model, ggml_backend_t backend) {
+    if (model.arch != LLM_ARCH_QWEN35MOE || !ggml_backend_is_vk(backend) || model.ssd_expert_addrs().empty()) {
+        return;
+    }
+
+    ggml_vk_ssd_expert_provider provider = {
+        /* .user_data = */ const_cast<llama_model *>(&model),
+        /* .read      = */ llama_vk_ssd_expert_read,
+    };
+    ggml_backend_vk_set_ssd_expert_provider(backend, &provider);
+}
+#endif
 
 llama_context::llama_context(
         const llama_model & model,
@@ -246,6 +297,12 @@ llama_context::llama_context(
         }
         backends.emplace_back(backend_cpu);
 
+#ifdef GGML_USE_VULKAN
+        for (auto & backend : backends) {
+            llama_vk_register_ssd_expert_provider(model, backend.get());
+        }
+#endif
+
         // create a list of the set_n_threads functions in the backends
         for (auto & backend : backends) {
             ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
@@ -367,6 +424,14 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+#ifdef GGML_USE_VULKAN
+    for (auto & backend : backends) {
+        if (ggml_backend_is_vk(backend.get())) {
+            ggml_backend_vk_set_ssd_expert_provider(backend.get(), nullptr);
+        }
+    }
+#endif
+
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
