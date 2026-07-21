@@ -2,6 +2,9 @@
 
 #include "llama-memory-recurrent.h"
 
+
+
+//function"llm_build_qwen35moe::llm_build_qwen35moe":main function
 llm_build_qwen35moe::llm_build_qwen35moe(const llama_model & model, const llm_graph_params & params) :
     llm_build_delta_net_base(params), model(model) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
@@ -113,6 +116,9 @@ ggml_tensor * llm_build_qwen35moe::build_norm_gated(
 
     return ggml_mul(ctx0, normalized, gated_silu);
 }
+
+
+
 
 ggml_tensor * llm_build_qwen35moe ::build_layer_attn(
         llm_graph_input_attn_kv * inp,

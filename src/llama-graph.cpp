@@ -1266,6 +1266,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         down_exps_s
     );
 }
+//regular call:gate_inp_b/up_exps_b/gate_exps_b/down_exps_b/gate_up_exps_b=nullptr
+//in qwen35.cpp:exp_probs_b/probs_in=nullptr
 
 ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * cur,
@@ -1347,7 +1349,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(selection_probs, "ffn_moe_probs_biased", il);
     }
 
-    // select top n_group_used expert groups
+    // select top n_group_used expert groups(先选出得分最高的若干个专家组，后续在里面进一步挑选专家。在本实验中没有使用)
     // https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/e815299b0bcbac849fa540c768ef21845365c9eb/modeling_deepseek.py#L440-L457
     if (hparams.n_expert_groups > 1 && n_tokens > 0) {
         const int64_t n_exp_per_group = n_expert / hparams.n_expert_groups;
@@ -1362,7 +1364,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         group_scores = ggml_sum_rows(ctx0, ggml_reshape_3d(ctx0, group_scores, group_scores->ne[1], group_scores->ne[2], group_scores->ne[3])); // [1, n_expert_groups, n_tokens]
         group_scores = ggml_reshape_2d(ctx0, group_scores, group_scores->ne[1], group_scores->ne[2]); // [n_expert_groups, n_tokens]
 
-        ggml_tensor * expert_groups = ggml_argsort_top_k(ctx0, group_scores, hparams.n_group_used); // [n_group_used, n_tokens]
+        ggml_tensor * expert_groups = ggml_argsort_top_k(ctx0, group_scores, hparams.n_expert_groups); // [n_group_used, n_tokens]
         cb(expert_groups, "ffn_moe_group_topk", il);
 
         // mask out the other groups
@@ -1373,6 +1375,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     // select experts
+    //probs/selection_probs：各token对于每个专家的评分  selected_experts：各token选出的top-K(n_expert_used)个专家id
     ggml_tensor * selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
     cb(selected_experts->src[0], "ffn_moe_argsort", il);
     cb(selected_experts, "ffn_moe_topk", il);
@@ -1386,6 +1389,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         probs = ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens);
     }
 
+    //weights：根据selected_experts取出的对应id处的权重值
     ggml_tensor * weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]
     cb(weights, "ffn_moe_weights", il);
 
@@ -1397,6 +1401,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(weights, "ffn_moe_weights_softmax", il);
     }
 
+    //对挑选出的n_expert_used个专家的权重做归一化(原本权重/权重和)，让概率之和=1
     if (norm_w) {
         weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
 
@@ -1412,6 +1417,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
         weights = ggml_reshape_3d(ctx0, weights, 1, n_expert_used, n_tokens);
     }
+
+    //对weights中的每一个值(当前经过归一化后和为1)进行缩放，乘以系数w_scale，目前暂时为0代表不进入该逻辑
     if (w_scale != 0.0f && w_scale != 1.0f) {
         weights = ggml_scale(ctx0, weights, w_scale);
         cb(weights, "ffn_moe_weights_scaled", il);
@@ -1432,6 +1439,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * up = nullptr;
     ggml_tensor * experts = nullptr;
 
+    //gate_up_exps代表up、gate权重矩阵存放到一个文件里面，cur乘以这个权重文件输出的是长度为2*n_ff的向量，表示up、gate向量的前后排列
+    //该实验的up、gate权重矩阵分开存放在两个文件中(up_exps/gate_exps)，因此进入else分支
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
         ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts); // [n_ff*2, n_expert_used, n_tokens]
@@ -1456,7 +1465,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(cur, "ffn_moe_gate", il);
         up  = ggml_view_3d(ctx0, gate_up, n_ff, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], n_ff * gate_up->nb[0]);
         cb(up, "ffn_moe_up", il);
-    } else {
+    }
+    else {
         // std::cout << ggml_get_name(up_exps) << " bytes:" << ggml_nbytes(up_exps) << std::endl;
         // separate gate and up path
         up = build_lora_mm_id(up_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
@@ -1868,6 +1878,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
+    // 重排序(Q向量):小Q维度/各工作流包含的token数/Q头数/工作流个数(一般指batch_size)
+    // 重排序(KV向量):小KV维度/各工作流包含的可视KV Cache token数/KV头数/工作流个数
     const auto n_stream = k->ne[3];
 
     q = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream, q->nb[1], q->nb[2], q->nb[3]/n_stream, 0);
@@ -1980,7 +1992,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         cur = ggml_cont_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
 
         if (!cparams.offload_kqv) {
-            // all nodes between the KV store and the attention output are run on the CPU
+            // 默认开启：KV Cache相关运算以及历史KV存放均在GPU端
             ggml_backend_sched_set_tensor_backend(sched, cur, backend_cpu);
         }
     }
