@@ -27,9 +27,28 @@ typedef bool (*ggml_vk_ssd_expert_read_t)(
         void * dst,
         size_t n_bytes);
 
+struct ggml_vk_ssd_expert_tensor_info {
+    enum ggml_type type;
+    int n_dims;
+    int expert_dim;
+    int64_t ne[GGML_MAX_DIMS];
+    size_t n_bytes;
+};
+
+typedef bool (*ggml_vk_ssd_expert_get_tensor_info_t)(
+        void * user_data,
+        int    layer,
+        int    kind,
+        struct ggml_vk_ssd_expert_tensor_info * info);
+
 struct ggml_vk_ssd_expert_provider {
     void * user_data;
     ggml_vk_ssd_expert_read_t read;
+    ggml_vk_ssd_expert_get_tensor_info_t get_tensor_info;
+    uint32_t n_layer;
+    uint32_t n_expert;
+    uint32_t n_expert_used;
+    uint32_t n_hot_expert;
 };
 
 GGML_BACKEND_API void ggml_backend_vk_set_ssd_expert_provider(

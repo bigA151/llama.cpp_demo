@@ -46,6 +46,8 @@ struct llama_ssd_expert_addr {
     size_t n_bytes;
 
     enum ggml_type type;
+    uint32_t n_dims;
+    uint32_t expert_dim;
     int64_t ne[GGML_MAX_DIMS];
     size_t nb[GGML_MAX_DIMS];
 

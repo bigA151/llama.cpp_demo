@@ -1486,6 +1486,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             cb(up, "ffn_moe_up_scaled", il);
         }
 
+        //进一步判断:如果参数中有gate_exps矩阵，则此时更新cur代表gate(注意是专家组成部分之一的gate而不是门控gate)，否则cur=up
         if (gate_exps) {
             // std::cout << ggml_get_name(gate_exps) << " bytes:" << ggml_nbytes(gate_exps) << std::endl;
             cur = build_lora_mm_id(gate_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
@@ -1513,6 +1514,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     switch (type_op) {
         case LLM_FFN_SILU:
+        //结构为LLM_ARCH_STEP35的特殊路径
             if (gate_exps) {
                 // Step35: per-layer clamp for routed experts
                 if (arch == LLM_ARCH_STEP35 && il >= 0) {
@@ -1534,6 +1536,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 }
             }
 
+        //在有gate_exps矩阵的情况下(含本实验)一般进入这里,ggml_swiglu_split函数完成cur=SiLU(gate)*up,cur为gate/up共同作用的结果
             if (has_gate) {
                 cur = ggml_swiglu_split(ctx0, cur, up);
                 cb(cur, "ffn_moe_swiglu", il);
@@ -1541,6 +1544,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 cur = ggml_silu(ctx0, cur);
                 cb(cur, "ffn_moe_silu", il);
             } break;
+
         case LLM_FFN_GELU:
             if (has_gate) {
                 cur = ggml_geglu_split(ctx0, cur, up);
@@ -1608,6 +1612,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     assert(n_expert_used > 0);
 
     // order the views before the adds
+    //cur_experts[i]的构成为:[第0个token被选中的第i个专家输出,第1个token被选中的第i个专家输出...]
+    //将各cur_experts进行叠加,最终输出moe_out,代表每个token融合了自己选中的 top-k 个专家的加权输出(维度为n_embd*n_tokens)
     for (uint32_t i = 0; i < hparams.n_expert_used; ++i) {
         cur_experts[i] = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
 

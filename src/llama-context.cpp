@@ -59,14 +59,55 @@ static bool llama_vk_ssd_expert_read(
     return false;
 }
 
-static void llama_vk_register_ssd_expert_provider(const llama_model & model, ggml_backend_t backend) {
+static bool llama_vk_ssd_expert_get_tensor_info(
+        void * user_data,
+        int    layer,
+        int    kind,
+        ggml_vk_ssd_expert_tensor_info * info) {
+    const llama_model * model = static_cast<const llama_model *>(user_data);
+    if (model == nullptr || info == nullptr) {
+        return false;
+    }
+
+    const llama_ssd_expert_tensor_kind wanted_kind = static_cast<llama_ssd_expert_tensor_kind>(kind);
+    for (const auto & addr : model->ssd_expert_addrs()) {
+        if ((int) addr.layer != layer || addr.expert != 0 || addr.kind != wanted_kind) {
+            continue;
+        }
+
+        info->type       = addr.type;
+        info->n_dims     = addr.n_dims;
+        info->expert_dim = addr.expert_dim;
+        info->n_bytes    = addr.n_bytes;
+        memcpy(info->ne, addr.ne, sizeof(info->ne));
+        return true;
+    }
+
+    LLAMA_LOG_ERROR("%s: missing SSD expert tensor info layer=%d kind=%d\n", __func__, layer, kind);
+    return false;
+}
+
+static void llama_vk_register_ssd_expert_provider(
+        const llama_model & model,
+        ggml_backend_t backend,
+        uint32_t n_hot_expert) {
     if (model.arch != LLM_ARCH_QWEN35MOE || !ggml_backend_is_vk(backend) || model.ssd_expert_addrs().empty()) {
         return;
     }
 
+    if (n_hot_expert < model.hparams.n_expert_used || n_hot_expert > model.hparams.n_expert) {
+        throw std::runtime_error(
+            "n_ssd_expert_cache must be between n_expert_used and n_expert for Qwen3.5MoE models");
+    }
+
     ggml_vk_ssd_expert_provider provider = {
-        /* .user_data = */ const_cast<llama_model *>(&model),
-        /* .read      = */ llama_vk_ssd_expert_read,
+        /* .user_data        = */ const_cast<llama_model *>(&model),
+        /* .read             = */ llama_vk_ssd_expert_read,
+        /* .get_tensor_info  = */ llama_vk_ssd_expert_get_tensor_info,
+        /* .n_layer          = */ model.hparams.n_layer - model.hparams.nextn_predict_layers,
+        /* .n_expert         = */ model.hparams.n_expert,
+        /* .n_expert_used    = */ model.hparams.n_expert_used,
+        /* .n_hot_expert     = */ n_hot_expert,
     };
     ggml_backend_vk_set_ssd_expert_provider(backend, &provider);
 }
@@ -299,7 +340,7 @@ llama_context::llama_context(
 
 #ifdef GGML_USE_VULKAN
         for (auto & backend : backends) {
-            llama_vk_register_ssd_expert_provider(model, backend.get());
+            llama_vk_register_ssd_expert_provider(model, backend.get(), params.n_ssd_expert_cache);
         }
 #endif
 
@@ -2954,6 +2995,7 @@ llama_context_params llama_context_default_params() {
         /*.n_ctx                       =*/ 512,
         /*.n_batch                     =*/ 2048,
         /*.n_ubatch                    =*/ 512,
+        /*.n_ssd_expert_cache          =*/ 180,
         /*.n_seq_max                   =*/ 1,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
