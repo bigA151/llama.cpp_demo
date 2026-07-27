@@ -1269,6 +1269,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_UBATCH"));
     add_opt(common_arg(
+        {"--ssd-expert-cache-experts"}, "N",
+        string_format("routed experts cached per Qwen3.5MoE layer (default: %d)", params.n_ssd_expert_cache),
+        [](common_params & params, int value) {
+            params.n_ssd_expert_cache = value;
+        }
+    ).set_env("LLAMA_ARG_SSD_EXPERT_CACHE_EXPERTS"));
+    add_opt(common_arg(
         {"--keep"}, "N",
         string_format("number of tokens to keep from the initial prompt (default: %d, -1 = all)", params.n_keep),
         [](common_params & params, int value) {

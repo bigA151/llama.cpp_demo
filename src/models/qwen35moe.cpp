@@ -2,6 +2,9 @@
 
 #include "llama-memory-recurrent.h"
 
+
+
+//function"llm_build_qwen35moe::llm_build_qwen35moe":main function
 llm_build_qwen35moe::llm_build_qwen35moe(const llama_model & model, const llm_graph_params & params) :
     llm_build_delta_net_base(params), model(model) {
     const int64_t n_embd_head = hparams.n_embd_head_v();
@@ -23,7 +26,8 @@ llm_build_qwen35moe::llm_build_qwen35moe(const llama_model & model, const llm_gr
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    for (int il = 0; il < n_layer; ++il) {
+    const int n_transformer_layers = n_layer - hparams.nextn_predict_layers;
+    for (int il = 0; il < n_transformer_layers; ++il) {
         ggml_tensor * inpSA = inpL;
 
         cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
@@ -40,7 +44,7 @@ llm_build_qwen35moe::llm_build_qwen35moe(const llama_model & model, const llm_gr
             cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il);
         }
 
-        if (il == n_layer - 1 && inp_out_ids) {
+        if (il == n_transformer_layers - 1 && inp_out_ids) {
             cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -113,6 +117,9 @@ ggml_tensor * llm_build_qwen35moe::build_norm_gated(
 
     return ggml_mul(ctx0, normalized, gated_silu);
 }
+
+
+
 
 ggml_tensor * llm_build_qwen35moe ::build_layer_attn(
         llm_graph_input_attn_kv * inp,
