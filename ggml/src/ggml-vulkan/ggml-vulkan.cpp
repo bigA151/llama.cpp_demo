@@ -14403,16 +14403,6 @@ static int32_t find_first_set(uint32_t x) {
     return ret;
 }
 
-typedef struct {
-    ggml_backend_buffer_t offload_down_exps_buffer;
-    ggml_backend_buffer_t offload_up_exps_buffer;
-    ggml_backend_buffer_t offload_gate_exps_buffer;
-    bool is_inited;
-    ggml_tallocr down_tallocr;
-    ggml_tallocr up_tallocr;
-    ggml_tallocr gate_tallocr;
-} offload_buffer_manager_t;
-
 int get_layer_id(ggml_tensor * tensor)
 {   
     const char* name = ggml_get_name(tensor);
@@ -14440,89 +14430,36 @@ int get_layer_id(ggml_tensor * tensor)
     return atoi(num_str);
 }
 
-offload_buffer_manager_t offload_buffer_manager = {};
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-void offload_buffer_manager_init(void)
-{   
-    GOOFY_VK_LOG_DEBUG("offload_buffer_manager_init");
-    ggml_backend_buffer_type_t buft = ggml_backend_vk_buffer_type(0);  //hard code device 0 
-
-    //hard code size
-    size_t up_size = 207618048;
-    size_t gate_size = 207618048;
-    size_t down_size = 308281344;
-
-    offload_buffer_manager.offload_up_exps_buffer = ggml_backend_vk_buffer_type_alloc_buffer(buft, up_size);
-    offload_buffer_manager.offload_gate_exps_buffer = ggml_backend_vk_buffer_type_alloc_buffer(buft, gate_size);
-    offload_buffer_manager.offload_down_exps_buffer = ggml_backend_vk_buffer_type_alloc_buffer(buft, down_size);
-
-    offload_buffer_manager.up_tallocr = ggml_tallocr_new(offload_buffer_manager.offload_up_exps_buffer);
-    offload_buffer_manager.gate_tallocr = ggml_tallocr_new(offload_buffer_manager.offload_gate_exps_buffer);
-    offload_buffer_manager.down_tallocr = ggml_tallocr_new(offload_buffer_manager.offload_down_exps_buffer);
-
-    void * up_addr = (char *)ggml_backend_buffer_get_base(offload_buffer_manager.up_tallocr.buffer) + offload_buffer_manager.up_tallocr.offset;
-    void * gate_addr = (char *)ggml_backend_buffer_get_base(offload_buffer_manager.gate_tallocr.buffer) + offload_buffer_manager.gate_tallocr.offset;
-    void * down_addr = (char *)ggml_backend_buffer_get_base(offload_buffer_manager.down_tallocr.buffer) + offload_buffer_manager.down_tallocr.offset;
-
-    GOOFY_VK_LOG_DEBUG("up_addr" << up_addr << "gate_addr" << gate_addr << "down_addr" << down_addr);
-
-    offload_buffer_manager.is_inited = true;
-    GGML_ASSERT(offload_buffer_manager.offload_up_exps_buffer != nullptr);
-    GGML_ASSERT(offload_buffer_manager.offload_gate_exps_buffer != nullptr);
-    GGML_ASSERT(offload_buffer_manager.offload_down_exps_buffer != nullptr);
-}
-
 #define EXPERT_NOT_LOADED -1
 
 typedef struct {
-
     ggml_backend_t backend;
-
-    ggml_backend_buffer_t offload_down_exps_buffer[48];
-    ggml_backend_buffer_t offload_up_exps_buffer[48];
-    ggml_backend_buffer_t offload_gate_exps_buffer[48];
     bool is_inited;
 
+    uint32_t n_expert;
+    uint32_t n_expert_used;
+    uint32_t n_hot_expert;
+    uint32_t n_layer;
 
-    int n_expert;
-    int n_expert_used;
-    int n_hot_expert;
-    int n_layer;
-
-    size_t up_size;
-    size_t down_size;
-    size_t gate_size;
-
-    size_t up_alloc_size;
-    size_t down_alloc_size;
-    size_t gate_alloc_size;
-
-    size_t up_size_single;
-    size_t down_size_single;
-    size_t gate_size_single;
-
-    int expert_map[48][256];
+    std::vector<ggml_backend_buffer_t> offload_down_exps_buffer;
+    std::vector<ggml_backend_buffer_t> offload_up_exps_buffer;
+    std::vector<ggml_backend_buffer_t> offload_gate_exps_buffer;
+    std::vector<std::vector<int32_t>> expert_map;
 
     struct ggml_context * offload_ctx; //need a ctx to create tensors
 
-    struct ggml_tensor * hot_gate_tensor[48];
-    struct ggml_tensor * hot_up_tensor[48];
-    struct ggml_tensor * hot_down_tensor[48];
+    std::vector<struct ggml_tensor *> hot_gate_tensor;
+    std::vector<struct ggml_tensor *> hot_up_tensor;
+    std::vector<struct ggml_tensor *> hot_down_tensor;
+    std::vector<ggml_vk_ssd_expert_tensor_info> gate_info;
+    std::vector<ggml_vk_ssd_expert_tensor_info> up_info;
+    std::vector<ggml_vk_ssd_expert_tensor_info> down_info;
 
-    int32_t argsort_buffer[256];  //save the argsort result
-    int32_t topk_buffer[8];  //used to overwrite the origin topk tensor
+    std::vector<int32_t> argsort_buffer;
+    std::vector<int32_t> topk_buffer;
 
-    int32_t topk_buffer_test[8];  //used for test
-    
-    struct ggml_tensor * mapped_topk_tensor;  // temp impl
+    struct ggml_tensor * mapped_topk_tensor;
     ggml_backend_buffer_t mapped_topk_buffer;
-
-    bool need_offload_test;
-
 } offload_buffer_manager_new_t;
 
 offload_buffer_manager_new_t om_519 = {};
@@ -14536,23 +14473,21 @@ static bool offload_expert_load_slice(
         size_t n_bytes,
         const char * kind_name) {
     if (om_519.backend == nullptr || !ggml_backend_is_vk(om_519.backend)) {
-        std::cerr << "SSD expert provider is unavailable: Vulkan backend is not initialized" << std::endl;
+        GGML_LOG_ERROR("%s: SSD expert provider is unavailable: Vulkan backend is not initialized\n", __func__);
         return false;
     }
 
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) om_519.backend->context;
     const ggml_vk_ssd_expert_provider & provider = ctx->ssd_expert_provider;
     if (provider.read == nullptr) {
-        std::cerr << "SSD expert provider is not registered" << std::endl;
+        GGML_LOG_ERROR("%s: SSD expert provider is not registered\n", __func__);
         return false;
     }
 
     std::vector<char> weight_buf(n_bytes);
     if (!provider.read(provider.user_data, layer_id, expert_id, kind, weight_buf.data(), n_bytes)) {
-        std::cerr << "Failed to read SSD expert slice: layer=" << layer_id
-                  << " expert=" << expert_id
-                  << " kind=" << kind_name
-                  << " n_bytes=" << n_bytes << std::endl;
+        GGML_LOG_ERROR("%s: failed to read SSD expert slice: layer=%d expert=%d kind=%s n_bytes=%zu\n",
+                __func__, layer_id, expert_id, kind_name, n_bytes);
         return false;
     }
 
@@ -14572,167 +14507,223 @@ void offload_expert_ctx_init(void)
     om_519.offload_ctx = ggml_init(goofy_params);
 }
 
-//create tensors for describing hot EXPERTs
-void offload_expert_tensor_init(struct ggml_context * ctx) 
-{   
+static bool offload_expert_get_tensor_info(
+        int layer,
+        int kind,
+        ggml_vk_ssd_expert_tensor_info * info) {
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) om_519.backend->context;
+    const ggml_vk_ssd_expert_provider & provider = ctx->ssd_expert_provider;
+    if (provider.get_tensor_info == nullptr || !provider.get_tensor_info(provider.user_data, layer, kind, info)) {
+        GGML_LOG_ERROR("%s: missing SSD expert tensor info for layer=%d kind=%d\n", __func__, layer, kind);
+        return false;
+    }
+
+    return true;
+}
+
+static bool offload_expert_tensor_create(
+        ggml_context * ctx,
+        const ggml_vk_ssd_expert_tensor_info & info,
+        ggml_backend_buffer_t * buffer,
+        ggml_tensor ** tensor) {
+    if (info.n_dims <= 0 || info.n_dims > GGML_MAX_DIMS || info.expert_dim < 0 || info.expert_dim >= info.n_dims ||
+            info.ne[info.expert_dim] != (int64_t) om_519.n_expert || info.n_bytes == 0) {
+        GGML_LOG_ERROR("%s: invalid SSD expert tensor info\n", __func__);
+        return false;
+    }
+
+    int64_t ne[GGML_MAX_DIMS];
+    memcpy(ne, info.ne, sizeof(ne));
+    ne[info.expert_dim] = om_519.n_hot_expert;
+
+    *tensor = ggml_new_tensor(ctx, info.type, info.n_dims, ne);
+    if ((*tensor)->nb[info.expert_dim] != info.n_bytes) {
+        GGML_LOG_ERROR("%s: expert stride does not match source slice size\n", __func__);
+        return false;
+    }
+
+    *buffer = ggml_backend_buft_alloc_buffer(
+            ggml_backend_get_default_buffer_type(om_519.backend),
+            ggml_nbytes(*tensor));
+    if (*buffer == nullptr) {
+        GGML_LOG_ERROR("%s: failed to allocate SSD expert buffer\n", __func__);
+        return false;
+    }
+
+    (*tensor)->buffer = *buffer;
+    (*tensor)->data = ggml_backend_buffer_get_base(*buffer);
+    return true;
+}
+
+static bool offload_expert_tensor_init(ggml_context * ctx) {
     GOOFY_VK_LOG_DEBUG("offload_expert_tensor_init");
-    for(int i = 0; i < om_519.n_layer; i++)
-    {
-        om_519.hot_gate_tensor[i] = ggml_new_tensor_3d(ctx, GGML_TYPE_IQ2_XXS, 3072, 1024, 180);
-        om_519.hot_gate_tensor[i]->buffer = om_519.offload_gate_exps_buffer[i];
-        om_519.hot_gate_tensor[i]->data = (char *)ggml_backend_buffer_get_base(om_519.offload_gate_exps_buffer[i]);
 
-        om_519.hot_up_tensor[i] = ggml_new_tensor_3d(ctx, GGML_TYPE_IQ2_XXS, 3072, 1024, 180);
-        om_519.hot_up_tensor[i]->buffer = om_519.offload_up_exps_buffer[i];
-        om_519.hot_up_tensor[i]->data = (char *)ggml_backend_buffer_get_base(om_519.offload_up_exps_buffer[i]);
+    for (uint32_t layer = 0; layer < om_519.n_layer; ++layer) {
+        auto & gate_info = om_519.gate_info[layer];
+        auto & up_info   = om_519.up_info[layer];
+        auto & down_info = om_519.down_info[layer];
 
-        om_519.hot_down_tensor[i] = ggml_new_tensor_3d(ctx, GGML_TYPE_IQ3_XXS, 1024, 3072, 180);
-        om_519.hot_down_tensor[i]->buffer = om_519.offload_down_exps_buffer[i];
-        om_519.hot_down_tensor[i]->data = (char *)ggml_backend_buffer_get_base(om_519.offload_down_exps_buffer[i]);
-        
+        if (!offload_expert_get_tensor_info(layer, GGML_VK_SSD_EXPERT_GATE, &gate_info) ||
+                !offload_expert_get_tensor_info(layer, GGML_VK_SSD_EXPERT_UP, &up_info) ||
+                !offload_expert_get_tensor_info(layer, GGML_VK_SSD_EXPERT_DOWN, &down_info) ||
+                !offload_expert_tensor_create(ctx, gate_info, &om_519.offload_gate_exps_buffer[layer], &om_519.hot_gate_tensor[layer]) ||
+                !offload_expert_tensor_create(ctx, up_info, &om_519.offload_up_exps_buffer[layer], &om_519.hot_up_tensor[layer]) ||
+                !offload_expert_tensor_create(ctx, down_info, &om_519.offload_down_exps_buffer[layer], &om_519.hot_down_tensor[layer])) {
+            return false;
+        }
     }
 
-    ggml_backend_buffer_type_t buft = ggml_backend_vk_buffer_type(0);  //hard code device 0 
-    om_519.mapped_topk_buffer = ggml_backend_vk_buffer_type_alloc_buffer(buft, (size_t)32); //8experts * 4byte
-    om_519.mapped_topk_tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 8, 1);
+    om_519.mapped_topk_tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, om_519.n_expert_used, 1);
+    om_519.mapped_topk_buffer = ggml_backend_buft_alloc_buffer(
+            ggml_backend_get_default_buffer_type(om_519.backend),
+            ggml_nbytes(om_519.mapped_topk_tensor));
+    if (om_519.mapped_topk_buffer == nullptr) {
+        GGML_LOG_ERROR("%s: failed to allocate mapped top-k buffer\n", __func__);
+        return false;
+    }
+
     om_519.mapped_topk_tensor->buffer = om_519.mapped_topk_buffer;
-    om_519.mapped_topk_tensor->data = (char *)ggml_backend_buffer_get_base(om_519.mapped_topk_buffer);
+    om_519.mapped_topk_tensor->data = ggml_backend_buffer_get_base(om_519.mapped_topk_buffer);
+    return true;
 }
 
-//load experts 0-179 at position 0-179 anyway, and init the map
-//expert_map[2][4] = 160 : layer2, expert4 is stored in buffer position 160
-//expert_map[3][5] = -1  : layer3, expert5 is not in vulkan buffer
-void offload_expert_and_map_init(void)
-{   
-    GOOFY_VK_LOG_DEBUG("offload_expert_and_map_init");
-    for (int i = 0; i < om_519.n_layer; i++) //48 layer
-    {   
-        for (int j = 0; j < om_519.n_expert; j++)
-        {   
-            if(j < om_519.n_hot_expert)
-            {
-                om_519.expert_map[i][j] = j;
-            }
-            else
-            {
-                om_519.expert_map[i][j] = EXPERT_NOT_LOADED;
-            }                                    
-        }
-        for (int expert = 0; expert < om_519.n_hot_expert; ++expert) {
-            offload_expert_load_slice(i, expert, GGML_VK_SSD_EXPERT_GATE,
-                    om_519.hot_gate_tensor[i], om_519.gate_size_single * expert, om_519.gate_size_single, "gate");
-            offload_expert_load_slice(i, expert, GGML_VK_SSD_EXPERT_UP,
-                    om_519.hot_up_tensor[i], om_519.up_size_single * expert, om_519.up_size_single, "up");
-            offload_expert_load_slice(i, expert, GGML_VK_SSD_EXPERT_DOWN,
-                    om_519.hot_down_tensor[i], om_519.down_size_single * expert, om_519.down_size_single, "down");
-        }
-    }   
-}
-
-void offload_buffer_manager_519_init(ggml_backend_t backend)
-{
-    GOOFY_VK_LOG_DEBUG("offload_buffer_manager_519_init");
-    om_519.is_inited = true;
-    ggml_backend_buffer_type_t buft = ggml_backend_vk_buffer_type(0);  //hard code device 0 
-
-    om_519.backend = backend;
-
-    //hard code para
-
-    // single layer total experts size
-    om_519.up_size = 207618048;
-    om_519.gate_size = 207618048;
-    om_519.down_size = 308281344;
-    om_519.n_expert = 256;
-    om_519.n_expert_used = 8;
-    om_519.n_layer = 48;
-    om_519.n_hot_expert = 180;
-
-    //single layer total alloc hot size
-    om_519.up_alloc_size = om_519.up_size * om_519.n_hot_expert / om_519.n_expert;
-    om_519.down_alloc_size = om_519.down_size * om_519.n_hot_expert / om_519.n_expert;
-    om_519.gate_alloc_size = om_519.gate_size * om_519.n_hot_expert / om_519.n_expert;
-
-    //single layer layer single expert size
-    om_519.up_size_single = om_519.up_size / om_519.n_expert;
-    om_519.gate_size_single = om_519.gate_size / om_519.n_expert;
-    om_519.down_size_single = om_519.down_size / om_519.n_expert;
-
-
-    for (int i = 0; i < om_519.n_layer; i++) //48 layer
-    {   
-        GOOFY_VK_LOG_DEBUG("alloc buf " << i << " size " << om_519.gate_alloc_size);
-        om_519.offload_gate_exps_buffer[i] = ggml_backend_vk_buffer_type_alloc_buffer(buft, om_519.gate_alloc_size);
-        om_519.offload_down_exps_buffer[i] = ggml_backend_vk_buffer_type_alloc_buffer(buft, om_519.down_alloc_size);        
-        om_519.offload_up_exps_buffer[i] = ggml_backend_vk_buffer_type_alloc_buffer(buft, om_519.up_alloc_size);
+static bool offload_expert_load_to_slot(
+        int layer,
+        int expert,
+        int kind,
+        ggml_tensor * tensor,
+        const ggml_vk_ssd_expert_tensor_info & info,
+        int slot,
+        const char * kind_name) {
+    if (slot < 0 || slot >= (int) om_519.n_hot_expert) {
+        GGML_LOG_ERROR("%s: invalid cache slot %d\n", __func__, slot);
+        return false;
     }
+
+    return offload_expert_load_slice(layer, expert, kind, tensor,
+            tensor->nb[info.expert_dim] * slot, info.n_bytes, kind_name);
+}
+
+static bool offload_expert_and_map_init(void) {
+    GOOFY_VK_LOG_DEBUG("offload_expert_and_map_init");
+    for (uint32_t layer = 0; layer < om_519.n_layer; ++layer) {
+        auto & expert_map = om_519.expert_map[layer];
+        std::fill(expert_map.begin(), expert_map.end(), EXPERT_NOT_LOADED);
+
+        for (uint32_t expert = 0; expert < om_519.n_hot_expert; ++expert) {
+            if (!offload_expert_load_to_slot(layer, expert, GGML_VK_SSD_EXPERT_GATE,
+                        om_519.hot_gate_tensor[layer], om_519.gate_info[layer], expert, "gate") ||
+                    !offload_expert_load_to_slot(layer, expert, GGML_VK_SSD_EXPERT_UP,
+                        om_519.hot_up_tensor[layer], om_519.up_info[layer], expert, "up") ||
+                    !offload_expert_load_to_slot(layer, expert, GGML_VK_SSD_EXPERT_DOWN,
+                        om_519.hot_down_tensor[layer], om_519.down_info[layer], expert, "down")) {
+                return false;
+            }
+
+            expert_map[expert] = expert;
+        }
+    }
+
+    return true;
+}
+
+static bool offload_expert_buffer_manager_init(ggml_backend_t backend) {
+    GOOFY_VK_LOG_DEBUG("offload_expert_buffer_manager_init");
+
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
+    const ggml_vk_ssd_expert_provider & provider = ctx->ssd_expert_provider;
+    if (provider.read == nullptr || provider.get_tensor_info == nullptr || provider.n_layer == 0 || provider.n_expert == 0 ||
+            provider.n_expert_used == 0 || provider.n_hot_expert < provider.n_expert_used || provider.n_hot_expert > provider.n_expert) {
+        GGML_LOG_ERROR("%s: invalid SSD expert provider configuration\n", __func__);
+        return false;
+    }
+
+    om_519.backend       = backend;
+    om_519.n_layer       = provider.n_layer;
+    om_519.n_expert      = provider.n_expert;
+    om_519.n_expert_used = provider.n_expert_used;
+    om_519.n_hot_expert  = provider.n_hot_expert;
+
+    const size_t n_layer = om_519.n_layer;
+    om_519.offload_gate_exps_buffer.resize(n_layer);
+    om_519.offload_up_exps_buffer.resize(n_layer);
+    om_519.offload_down_exps_buffer.resize(n_layer);
+    om_519.hot_gate_tensor.resize(n_layer);
+    om_519.hot_up_tensor.resize(n_layer);
+    om_519.hot_down_tensor.resize(n_layer);
+    om_519.gate_info.resize(n_layer);
+    om_519.up_info.resize(n_layer);
+    om_519.down_info.resize(n_layer);
+    om_519.expert_map.assign(n_layer, std::vector<int32_t>(provider.n_expert, EXPERT_NOT_LOADED));
+    om_519.argsort_buffer.resize(provider.n_expert);
+    om_519.topk_buffer.resize(provider.n_expert_used);
 
     offload_expert_ctx_init();
-
-    offload_expert_tensor_init(om_519.offload_ctx);
-
-    offload_expert_and_map_init(); 
-    GOOFY_VK_LOG_DEBUG("offload_buffer_manager_519_init end");
-}
-
-
-#ifdef __cplusplus
-}
-#endif
-
-//judge if hot expert is in vram, if not, read from file and update the map
-void hot_expert_offload_process(int layer_id)
-{   
-    // GOOFY_VK_LOG_DEBUG("hot_expert_offload_process");
-    int cur_expert_id;
-    int* expert_map = om_519.expert_map[layer_id];
-    // int expert_map[256] = om_519.expert_map[layer_id];
-    int rm_pos_idx = 255; //remove least relevent expert from the last sorted
-    int expert_rm_idx;
-    for(int i = 0; i < 8; i++)
-    {   
-        cur_expert_id = om_519.argsort_buffer[i];
-        if(expert_map[cur_expert_id] == EXPERT_NOT_LOADED)
-        {
-            //expert not in vram, load from file
-            expert_rm_idx = om_519.argsort_buffer[rm_pos_idx];
-            while(expert_map[expert_rm_idx] == EXPERT_NOT_LOADED)
-            {
-                rm_pos_idx--;
-                expert_rm_idx = om_519.argsort_buffer[rm_pos_idx];
-            }
-            expert_map[cur_expert_id] = expert_map[expert_rm_idx];
-            expert_map[expert_rm_idx] = EXPERT_NOT_LOADED;
-            GOOFY_VK_LOG_DEBUG("layer:" << layer_id << " load " << cur_expert_id << " at " << expert_map[cur_expert_id] << " remove " << expert_rm_idx);
-
-
-            offload_expert_load_slice(layer_id, cur_expert_id, GGML_VK_SSD_EXPERT_GATE,
-                    om_519.hot_gate_tensor[layer_id], om_519.gate_size_single * expert_map[cur_expert_id], om_519.gate_size_single, "gate");
-            offload_expert_load_slice(layer_id, cur_expert_id, GGML_VK_SSD_EXPERT_UP,
-                    om_519.hot_up_tensor[layer_id], om_519.up_size_single * expert_map[cur_expert_id], om_519.up_size_single, "up");
-            offload_expert_load_slice(layer_id, cur_expert_id, GGML_VK_SSD_EXPERT_DOWN,
-                    om_519.hot_down_tensor[layer_id], om_519.down_size_single * expert_map[cur_expert_id], om_519.down_size_single, "down");
-
-        }
-        else
-        {   
-            //expert in vram, do nothing
-        }
+    if (om_519.offload_ctx == nullptr || !offload_expert_tensor_init(om_519.offload_ctx) || !offload_expert_and_map_init()) {
+        return false;
     }
+
+    om_519.is_inited = true;
+    return true;
+}
+
+
+// judge if a routed expert is in VRAM; load and map it if necessary
+static bool hot_expert_offload_process(int layer_id) {
+    if (layer_id < 0 || layer_id >= (int) om_519.n_layer) {
+        GGML_LOG_ERROR("%s: invalid layer %d\n", __func__, layer_id);
+        return false;
+    }
+
+    auto & expert_map = om_519.expert_map[layer_id];
+    for (uint32_t i = 0; i < om_519.n_expert_used; ++i) {
+        const int cur_expert_id = om_519.argsort_buffer[i];
+        if (cur_expert_id < 0 || cur_expert_id >= (int) om_519.n_expert) {
+            GGML_LOG_ERROR("%s: invalid routed expert %d\n", __func__, cur_expert_id);
+            return false;
+        }
+        if (expert_map[cur_expert_id] != EXPERT_NOT_LOADED) {
+            continue;
+        }
+
+        int expert_rm_idx = -1;
+        for (int rm_pos_idx = om_519.n_expert - 1; rm_pos_idx >= 0; --rm_pos_idx) {
+            const int candidate = om_519.argsort_buffer[rm_pos_idx];
+            if (candidate >= 0 && candidate < (int) om_519.n_expert && expert_map[candidate] != EXPERT_NOT_LOADED) {
+                expert_rm_idx = candidate;
+                break;
+            }
+        }
+        if (expert_rm_idx == -1) {
+            GGML_LOG_ERROR("%s: no resident expert is available for eviction\n", __func__);
+            return false;
+        }
+
+        const int slot = expert_map[expert_rm_idx];
+        if (!offload_expert_load_to_slot(layer_id, cur_expert_id, GGML_VK_SSD_EXPERT_GATE,
+                    om_519.hot_gate_tensor[layer_id], om_519.gate_info[layer_id], slot, "gate") ||
+                !offload_expert_load_to_slot(layer_id, cur_expert_id, GGML_VK_SSD_EXPERT_UP,
+                    om_519.hot_up_tensor[layer_id], om_519.up_info[layer_id], slot, "up") ||
+                !offload_expert_load_to_slot(layer_id, cur_expert_id, GGML_VK_SSD_EXPERT_DOWN,
+                    om_519.hot_down_tensor[layer_id], om_519.down_info[layer_id], slot, "down")) {
+            return false;
+        }
+
+        expert_map[cur_expert_id] = slot;
+        expert_map[expert_rm_idx] = EXPERT_NOT_LOADED;
+    }
+
+    return true;
 }
 
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
 
-    if(!offload_buffer_manager.is_inited)
-    {
-        offload_buffer_manager_init();
-    }
-
-    if(!om_519.is_inited)
-    {
-        offload_buffer_manager_519_init(backend);
+    if (!om_519.is_inited && ctx->ssd_expert_provider.get_tensor_info != nullptr) {
+        if (!offload_expert_buffer_manager_init(backend)) {
+            return GGML_STATUS_FAILED;
+        }
     }
 
     if (vk_instance.debug_utils_support) {
@@ -15018,7 +15009,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         // std::string target_str = "ffn_moe_argsort-";
         std::string target_str = "ffn_moe_weights-";
         std::string target_str_no = "reshaped";         
-        bool goofy_test_ffn_submit = (find_expected_node(cgraph->nodes[i], target_str)) && (!find_expected_node(cgraph->nodes[i], target_str_no));
+        bool goofy_test_ffn_submit = om_519.is_inited &&
+                find_expected_node(cgraph->nodes[i], target_str) &&
+                !find_expected_node(cgraph->nodes[i], target_str_no);
+        const int ffn_weights_idx = i;
+        const int additional_fused_ops = ctx->num_additional_fused_ops;
         //bool goofy_test_ffn_submit = false;
 
         bool submit = (submitted_nodes >= nodes_per_submit) ||
@@ -15083,40 +15078,63 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
             int layer_id = get_layer_id(cgraph->nodes[i]);
 
-            size_t argsort_size = ggml_nbytes(cgraph->nodes[i-2]);
+            const int argsort_idx = i - 2;
+            if (argsort_idx < 0 || argsort_idx >= cgraph->n_nodes) {
+                GGML_LOG_ERROR("%s: invalid SSD expert argsort candidate index %d (trigger_idx=%d, current_idx=%d, fused_ops=%d, n_nodes=%d)\n",
+                        __func__, argsort_idx, ffn_weights_idx, i, additional_fused_ops, cgraph->n_nodes);
+                return GGML_STATUS_FAILED;
+            }
 
-            if(1)
-            {   
-                // GOOFY_VK_LOG_DEBUG("gate_rework:" << ggml_get_name(cgraph->nodes[i]));
-                ggml_backend_vk_get_tensor_async(backend, cgraph->nodes[i-2], om_519.argsort_buffer, 0, argsort_size);
-                ggml_vk_synchronize(ctx);                
+            ggml_tensor * argsort_candidate = cgraph->nodes[argsort_idx];
+            size_t argsort_size = ggml_nbytes(argsort_candidate);
 
-                hot_expert_offload_process(layer_id);
+            // A microbatch can have no output tokens after the final-layer output filtering.
+            // There is no expert routing or cache update to perform for this zero-row tensor.
+            if (argsort_size == 0) {
+                continue;
+            }
 
-                // GOOFY_VK_LOG_DEBUG("write mapped_buffer");
-                for(int i = 0; i < 8; i++)
-                {   
-                    om_519.topk_buffer[i] = om_519.expert_map[layer_id][om_519.argsort_buffer[i]];
-                }
-                ggml_backend_vk_set_tensor_async(backend, om_519.mapped_topk_tensor, om_519.topk_buffer, 0, 32);
-                ggml_vk_synchronize(ctx);
+            if (argsort_size != om_519.argsort_buffer.size() * sizeof(int32_t)) {
+                GGML_LOG_ERROR("%s: SSD expert argsort size mismatch: got %zu bytes, expected %zu bytes\n",
+                        __func__, argsort_size, om_519.argsort_buffer.size() * sizeof(int32_t));
+                GGML_LOG_ERROR("%s: trigger_idx=%d trigger='%s', current_idx=%d, fused_ops=%d, candidate_idx=%d candidate='%s' op=%s type=%s ne=[%lld, %lld, %lld, %lld]\n",
+                        __func__, ffn_weights_idx, ggml_get_name(cgraph->nodes[ffn_weights_idx]), i, additional_fused_ops,
+                        argsort_idx, ggml_get_name(argsort_candidate), ggml_op_name(argsort_candidate->op),
+                        ggml_type_name(argsort_candidate->type), static_cast<long long>(argsort_candidate->ne[0]),
+                        static_cast<long long>(argsort_candidate->ne[1]), static_cast<long long>(argsort_candidate->ne[2]),
+                        static_cast<long long>(argsort_candidate->ne[3]));
+                return GGML_STATUS_FAILED;
+            }
 
-                // we need to change the caculate matrix at here
+            ggml_backend_vk_get_tensor_async(backend, argsort_candidate, om_519.argsort_buffer.data(), 0, argsort_size);
+            ggml_vk_synchronize(ctx);
+
+            if (!hot_expert_offload_process(layer_id)) {
+                return GGML_STATUS_FAILED;
+            }
+
+            for (uint32_t topk = 0; topk < om_519.n_expert_used; ++topk) {
+                om_519.topk_buffer[topk] = om_519.expert_map[layer_id][om_519.argsort_buffer[topk]];
+            }
+            ggml_backend_vk_set_tensor_async(backend, om_519.mapped_topk_tensor, om_519.topk_buffer.data(), 0,
+                    ggml_nbytes(om_519.mapped_topk_tensor));
+            ggml_vk_synchronize(ctx);
+
+            // we need to change the caculate matrix at here
 
                 // GOOFY_VK_LOG_DEBUG("before src[0] ne" << cgraph->nodes[down_idx]->src[0]->ne[0] << cgraph->nodes[down_idx]->src[0]->ne[1] << cgraph->nodes[down_idx]->src[0]->ne[2] << cgraph->nodes[down_idx]->src[0]->ne[3]);
                 // GOOFY_VK_LOG_DEBUG("before src[2] ne" << cgraph->nodes[down_idx]->src[2]->ne[0] << cgraph->nodes[down_idx]->src[2]->ne[1] << cgraph->nodes[down_idx]->src[2]->ne[2] << cgraph->nodes[down_idx]->src[2]->ne[3]);
 
-                cgraph->nodes[gate_idx]->src[0] = om_519.hot_gate_tensor[layer_id];
-                cgraph->nodes[gate_idx]->src[2] = om_519.mapped_topk_tensor; 
-                cgraph->nodes[up_idx]->src[0] = om_519.hot_up_tensor[layer_id];
-                cgraph->nodes[up_idx]->src[2] = om_519.mapped_topk_tensor; 
-                cgraph->nodes[down_idx]->src[0] = om_519.hot_down_tensor[layer_id];
-                cgraph->nodes[down_idx]->src[2] = om_519.mapped_topk_tensor; 
+            cgraph->nodes[gate_idx]->src[0] = om_519.hot_gate_tensor[layer_id];
+            cgraph->nodes[gate_idx]->src[2] = om_519.mapped_topk_tensor;
+            cgraph->nodes[up_idx]->src[0] = om_519.hot_up_tensor[layer_id];
+            cgraph->nodes[up_idx]->src[2] = om_519.mapped_topk_tensor;
+            cgraph->nodes[down_idx]->src[0] = om_519.hot_down_tensor[layer_id];
+            cgraph->nodes[down_idx]->src[2] = om_519.mapped_topk_tensor;
 
                 // GOOFY_VK_LOG_DEBUG("after src[0] ne" << cgraph->nodes[down_idx]->src[0]->ne[0] << cgraph->nodes[down_idx]->src[0]->ne[1] << cgraph->nodes[down_idx]->src[0]->ne[2] << cgraph->nodes[down_idx]->src[0]->ne[3]);
                 // GOOFY_VK_LOG_DEBUG("after src[2] ne" << cgraph->nodes[down_idx]->src[2]->ne[0] << cgraph->nodes[down_idx]->src[2]->ne[1] << cgraph->nodes[down_idx]->src[2]->ne[2] << cgraph->nodes[down_idx]->src[2]->ne[3]);
 
-            }     
         }
     }
 
