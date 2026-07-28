@@ -137,6 +137,9 @@ extern "C" {
 
         // (optional) sort/optimize the nodes in the graph
         void                      (*graph_optimize)    (ggml_backend_t backend, struct ggml_cgraph * cgraph);
+
+        // (optional) complete pending operations while preserving graph-lifetime resources
+        void (*synchronize_intermediate)(ggml_backend_t backend);
     };
 
     struct ggml_backend {
