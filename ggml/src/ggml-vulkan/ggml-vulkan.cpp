@@ -1,7 +1,7 @@
 #include "ggml-vulkan.h"
 #include <vulkan/vulkan_core.h>
-#if defined(GGML_VULKAN_RUN_TESTS) || defined(GGML_VULKAN_CHECK_RESULTS)
 #include <chrono>
+#if defined(GGML_VULKAN_RUN_TESTS) || defined(GGML_VULKAN_CHECK_RESULTS)
 #include "ggml-cpu.h"
 #endif
 
@@ -26,6 +26,7 @@ DispatchLoaderDynamic & ggml_vk_default_dispatcher();
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <tuple>
@@ -261,7 +262,80 @@ static ggml_backend_buffer_type_i ggml_backend_vk_buffer_type_interface = {
 class vk_memory_logger;
 class vk_perf_logger;
 static void ggml_vk_destroy_buffer(vk_buffer& buf);
-static void ggml_vk_synchronize(ggml_backend_vk_context * ctx);
+
+struct ssd_vk_sync_timing_data {
+    int64_t transfer_submit_us = 0;
+    int64_t compute_submit_us = 0;
+    int64_t fence_submit_us = 0;
+    int64_t fence_wait_us = 0;
+    int64_t output_copy_us = 0;
+    bool submitted_transfer = false;
+    bool submitted_compute = false;
+    bool waited = false;
+};
+
+struct ssd_vk_sync_timing_record {
+    ssd_vk_sync_timing_data sync;
+    int64_t cleanup_us = 0;
+    int64_t other_us = 0;
+    int64_t total_us = 0;
+};
+
+struct ssd_vk_sync_timing_summary {
+    size_t calls = 0;
+    size_t transfer_work = 0;
+    size_t compute_work = 0;
+    size_t waited = 0;
+    int64_t transfer_submit_us = 0;
+    int64_t compute_submit_us = 0;
+    int64_t fence_submit_us = 0;
+    int64_t fence_wait_us = 0;
+    int64_t output_copy_us = 0;
+    int64_t cleanup_us = 0;
+    int64_t other_us = 0;
+    int64_t total_us = 0;
+
+    void add(const ssd_vk_sync_timing_record & record) {
+        ++calls;
+        transfer_work += record.sync.submitted_transfer ? 1 : 0;
+        compute_work += record.sync.submitted_compute ? 1 : 0;
+        waited += record.sync.waited ? 1 : 0;
+        transfer_submit_us += record.sync.transfer_submit_us;
+        compute_submit_us += record.sync.compute_submit_us;
+        fence_submit_us += record.sync.fence_submit_us;
+        fence_wait_us += record.sync.fence_wait_us;
+        output_copy_us += record.sync.output_copy_us;
+        cleanup_us += record.cleanup_us;
+        other_us += record.other_us;
+        total_us += record.total_us;
+    }
+};
+
+struct ssd_vk_cache_timing_summary {
+    size_t layers = 0;
+    size_t loads = 0;
+    int64_t plan_us = 0;
+    int64_t expert_load_us = 0;
+    int64_t mapped_upload_us = 0;
+    int64_t total_us = 0;
+};
+
+struct ssd_vk_timing_capture {
+    bool active = false;
+    bool prefill = false;
+    size_t n_tokens = 0;
+    ssd_vk_sync_timing_summary standalone_sync;
+    ssd_vk_sync_timing_summary layer_sync;
+    ssd_vk_cache_timing_summary cache;
+    ssd_vk_sync_timing_record pending_sync;
+    bool has_pending_sync = false;
+};
+
+static bool ssd_expert_timing_enabled();
+static int64_t ssd_expert_timing_now_us();
+static void ggml_vk_synchronize(
+        ggml_backend_vk_context * ctx,
+        ssd_vk_sync_timing_data * timing = nullptr);
 
 static constexpr uint32_t mul_mat_vec_max_cols = 8;
 static constexpr uint32_t p021_max_gqa_ratio = 8;
@@ -1890,6 +1964,8 @@ struct ggml_backend_vk_context {
     vk_buffer prealloc_x, prealloc_y, prealloc_split_k, prealloc_add_rms_partials, sync_staging;
     vk::Fence fence, almost_ready_fence;
     bool submit_pending {};
+    bool cleanup_pending {};
+    ssd_vk_timing_capture ssd_timing;
     bool almost_ready_fence_pending {};
     // Set before op_add and unset after op_rms_norm to indicate that the add should
     // write partial sums to accumulate the square of the vector components
@@ -2490,6 +2566,7 @@ static vk_context ggml_vk_create_context(ggml_backend_vk_context * ctx, vk_comma
     vk_context result = std::make_shared<vk_context_struct>();
     VK_LOG_DEBUG("ggml_vk_create_context(" << result << ")");
     ctx->gc.contexts.emplace_back(result);
+    ctx->cleanup_pending = true;
     result->p = &p;
     return result;
 }
@@ -12721,10 +12798,15 @@ static void ggml_vk_test_dequant_matmul(ggml_backend_vk_context * ctx, size_t m,
 }
 #endif
 
-static bool find_expected_node(ggml_tensor * node, std::string target_str)
-{   
-    std::string node_str = ggml_get_name(node);
-    return (node_str.find(target_str) != std::string::npos);
+static int find_named_node_index(const ggml_cgraph * cgraph, const char * name, enum ggml_op op) {
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node->op == op && strcmp(ggml_get_name(node), name) == 0) {
+            return i;
+        }
+    }
+
+    return -1;
 }
 
 static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subctx) {
@@ -13449,6 +13531,7 @@ static void ggml_vk_graph_cleanup(ggml_backend_vk_context * ctx) {
     ctx->gc.contexts.clear();
     ctx->pipeline_descriptor_set_requirements = 0;
     ctx->descriptor_set_idx = 0;
+    ctx->cleanup_pending = false;
 }
 
 // Clean up on backend free
@@ -13918,17 +14001,26 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
     return false;
 }
 
-static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
+static void ggml_vk_synchronize(
+        ggml_backend_vk_context * ctx,
+        ssd_vk_sync_timing_data * timing) {
     VK_LOG_DEBUG("ggml_vk_synchronize()");
 
     bool do_transfer = !ctx->compute_ctx.expired();
 
-    if (ggml_vk_submit_transfer_ctx(ctx)) {
+    const int64_t transfer_submit_start_us = timing != nullptr ? ssd_expert_timing_now_us() : 0;
+    const bool submitted_transfer = ggml_vk_submit_transfer_ctx(ctx);
+    if (timing != nullptr) {
+        timing->transfer_submit_us += ssd_expert_timing_now_us() - transfer_submit_start_us;
+        timing->submitted_transfer = submitted_transfer;
+    }
+    if (submitted_transfer) {
         ctx->submit_pending = true;
     }
 
     vk_context compute_ctx;
     vk_command_buffer* cmd_buf = nullptr;
+    const int64_t compute_submit_start_us = timing != nullptr ? ssd_expert_timing_now_us() : 0;
     if (do_transfer) {
         compute_ctx = ctx->compute_ctx.lock();
         if (compute_ctx->s) {
@@ -13944,8 +14036,13 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
         ggml_vk_submit(compute_ctx, {});
         ctx->submit_pending = true;
     }
+    if (timing != nullptr) {
+        timing->compute_submit_us += ssd_expert_timing_now_us() - compute_submit_start_us;
+        timing->submitted_compute = do_transfer;
+    }
 
     if (ctx->submit_pending) {
+        const int64_t fence_submit_start_us = timing != nullptr ? ssd_expert_timing_now_us() : 0;
         if (ctx->device->async_use_transfer_queue && ctx->transfer_semaphore_last_submitted < ctx->transfer_semaphore.value) {
             vk::TimelineSemaphoreSubmitInfo tl_info{
                 1, &ctx->transfer_semaphore.value,
@@ -13965,7 +14062,15 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
             std::lock_guard<std::mutex> guard(queue_mutex);
             ctx->device->compute_queue.queue.submit({}, ctx->fence);
         }
+        if (timing != nullptr) {
+            timing->fence_submit_us += ssd_expert_timing_now_us() - fence_submit_start_us;
+        }
+        const int64_t fence_wait_start_us = timing != nullptr ? ssd_expert_timing_now_us() : 0;
         ggml_vk_wait_for_fence(ctx);
+        if (timing != nullptr) {
+            timing->fence_wait_us += ssd_expert_timing_now_us() - fence_wait_start_us;
+            timing->waited = true;
+        }
         ctx->submit_pending = false;
         if (cmd_buf) {
             cmd_buf->in_use = false;
@@ -13973,21 +14078,52 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
         }
     }
 
+    const int64_t output_copy_start_us = timing != nullptr ? ssd_expert_timing_now_us() : 0;
     if (do_transfer) {
         for (auto& cpy : compute_ctx->out_memcpys) {
             memcpy(cpy.dst, cpy.src, cpy.n);
         }
         ctx->compute_ctx.reset();
     }
+    if (timing != nullptr) {
+        timing->output_copy_us += ssd_expert_timing_now_us() - output_copy_start_us;
+    }
+}
+
+static void ggml_backend_vk_synchronize_impl(ggml_backend_t backend, bool cleanup) {
+    VK_LOG_DEBUG("ggml_backend_vk_synchronize_impl(cleanup=" << cleanup << ")");
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+
+    const bool ssd_detailed_timing = ctx->ssd_timing.active;
+    if (ssd_detailed_timing && ctx->ssd_timing.has_pending_sync) {
+        ctx->ssd_timing.standalone_sync.add(ctx->ssd_timing.pending_sync);
+        ctx->ssd_timing.has_pending_sync = false;
+    }
+    ssd_vk_sync_timing_data timing = {};
+    const int64_t total_start_us = ssd_detailed_timing ? ssd_expert_timing_now_us() : 0;
+    ggml_vk_synchronize(ctx, ssd_detailed_timing ? &timing : nullptr);
+
+    const int64_t cleanup_start_us = ssd_detailed_timing ? ssd_expert_timing_now_us() : 0;
+    if (cleanup && ctx->cleanup_pending) {
+        ggml_vk_graph_cleanup(ctx);
+    }
+    if (ssd_detailed_timing) {
+        const int64_t cleanup_us = ssd_expert_timing_now_us() - cleanup_start_us;
+        const int64_t total_us = ssd_expert_timing_now_us() - total_start_us;
+        const int64_t measured_us = timing.transfer_submit_us + timing.compute_submit_us +
+                timing.fence_submit_us + timing.fence_wait_us + timing.output_copy_us + cleanup_us;
+        const int64_t other_us = total_us > measured_us ? total_us - measured_us : 0;
+        ctx->ssd_timing.pending_sync = { timing, cleanup_us, other_us, total_us };
+        ctx->ssd_timing.has_pending_sync = true;
+    }
 }
 
 static void ggml_backend_vk_synchronize(ggml_backend_t backend) {
-    VK_LOG_DEBUG("ggml_backend_vk_synchronize()");
-    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+    ggml_backend_vk_synchronize_impl(backend, true);
+}
 
-    ggml_vk_synchronize(ctx);
-
-    ggml_vk_graph_cleanup(ctx);
+static void ggml_backend_vk_synchronize_intermediate(ggml_backend_t backend) {
+    ggml_backend_vk_synchronize_impl(backend, false);
 }
 
 static bool ggml_vk_is_empty(ggml_tensor * node) {
@@ -14403,33 +14539,6 @@ static int32_t find_first_set(uint32_t x) {
     return ret;
 }
 
-int get_layer_id(ggml_tensor * tensor)
-{   
-    const char* name = ggml_get_name(tensor);
-    char str[64];
-    snprintf(str, sizeof(str), "%s", name);
-    int len = strlen(str);
-    int start = 0;
-
-    for (int i = len - 1; i >= 0; i--) {
-        if (str[i] >= '0' && str[i] <= '9') {
-            start = i;  // 记录数字部分的起始位置
-        } else {
-            break;      // 遇到非数字字符，停止
-        }
-    }
-    
-    // 如果没有找到数字，返回 0 或错误值
-    if (start > len - 1) {
-        return 0;
-    }
-    
-    // 提取数字部分并转换
-    char num_str[64];
-    strcpy(num_str, str + start);
-    return atoi(num_str);
-}
-
 #define EXPERT_NOT_LOADED -1
 
 typedef struct {
@@ -14457,12 +14566,44 @@ typedef struct {
 
     std::vector<int32_t> argsort_buffer;
     std::vector<int32_t> topk_buffer;
+    std::vector<ggml_vk_ssd_expert_cache_load> cache_load_plan;
 
     struct ggml_tensor * mapped_topk_tensor;
     ggml_backend_buffer_t mapped_topk_buffer;
 } offload_buffer_manager_new_t;
 
 offload_buffer_manager_new_t om_519 = {};
+
+// BEGIN SSD expert timing diagnostics (remove together with the matching END marker)
+struct ssd_expert_timing_data {
+    int64_t plan_us = 0;
+    int64_t expert_load_us = 0;
+    size_t n_loads = 0;
+};
+
+static bool ssd_expert_timing_enabled() {
+    static const bool enabled = []() {
+        const char * value = getenv("LLAMA_SSD_EXPERT_TIMING");
+        return value != nullptr && strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+static int64_t ssd_expert_timing_now_us() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+static thread_local ssd_expert_timing_data ssd_expert_timing;
+
+static bool ssd_expert_timing_capture_active() {
+    if (om_519.backend == nullptr || !ggml_backend_is_vk(om_519.backend)) {
+        return false;
+    }
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) om_519.backend->context;
+    return ctx->ssd_timing.active;
+}
+// END SSD expert timing diagnostics
 
 static bool offload_expert_load_slice(
         int layer_id,
@@ -14665,7 +14806,8 @@ static bool offload_expert_buffer_manager_init(ggml_backend_t backend) {
 
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
     const ggml_vk_ssd_expert_provider & provider = ctx->ssd_expert_provider;
-    if (provider.read == nullptr || provider.get_tensor_info == nullptr || provider.n_layer == 0 || provider.n_expert == 0 ||
+    if (provider.read == nullptr || provider.get_tensor_info == nullptr || provider.prepare_cache == nullptr ||
+            provider.n_layer == 0 || provider.n_expert == 0 ||
             provider.n_expert_used == 0 || provider.n_hot_expert < provider.n_expert_used || provider.n_hot_expert > provider.n_expert) {
         GGML_LOG_ERROR("%s: invalid SSD expert provider configuration\n", __func__);
         return false;
@@ -14690,6 +14832,7 @@ static bool offload_expert_buffer_manager_init(ggml_backend_t backend) {
     om_519.expert_map.assign(n_layer, std::vector<int32_t>(provider.n_expert, EXPERT_NOT_LOADED));
     om_519.argsort_buffer.resize(provider.n_expert);
     om_519.topk_buffer.resize(provider.n_expert_used);
+    om_519.cache_load_plan.resize(provider.n_expert);
 
     offload_expert_ctx_init();
     if (om_519.offload_ctx == nullptr || !offload_expert_tensor_init(om_519.offload_ctx) || !offload_expert_and_map_init()) {
@@ -14703,6 +14846,11 @@ static bool offload_expert_buffer_manager_init(ggml_backend_t backend) {
 
 // judge if the routed experts are in VRAM; load and map them if necessary
 static bool hot_expert_offload_process(int layer_id, size_t n_tokens) {
+    const bool ssd_timing = ssd_expert_timing_capture_active();
+    if (ssd_timing) {
+        ssd_expert_timing = {};
+    }
+
     if (layer_id < 0 || layer_id >= (int) om_519.n_layer) {
         GGML_LOG_ERROR("%s: invalid layer %d\n", __func__, layer_id);
         return false;
@@ -14714,107 +14862,66 @@ static bool hot_expert_offload_process(int layer_id, size_t n_tokens) {
         return false;
     }
 
-    auto & expert_map = om_519.expert_map[layer_id];
-    std::vector<int32_t> selected_topk(n_tokens * om_519.n_expert_used);
-    std::vector<bool> required(om_519.n_expert, false);
-    std::vector<int> missing;
-    size_t n_required = 0;
-
-    for (size_t token = 0; token < n_tokens; ++token) {
-        const size_t token_offset = token * om_519.n_expert;
-        const size_t topk_offset = token * om_519.n_expert_used;
-        std::vector<int32_t> cold_positions;
-        std::vector<int32_t> replacement_experts;
-
-        for (uint32_t topk = 0; topk < om_519.n_expert_used; ++topk) {
-            const int expert = om_519.argsort_buffer[token_offset + topk];
-            if (expert < 0 || expert >= (int) om_519.n_expert) {
-                GGML_LOG_ERROR("%s: invalid routed expert %d for token %zu\n", __func__, expert, token);
-                return false;
-            }
-            selected_topk[topk_offset + topk] = expert;
-        }
-
-        for (int topk = (int) om_519.n_expert_used - 1; topk >= 0; --topk) {
-            if (expert_map[selected_topk[topk_offset + topk]] == EXPERT_NOT_LOADED) {
-                cold_positions.push_back(topk);
-            }
-        }
-
-        const uint32_t candidate_end = std::min(om_519.n_expert, om_519.n_expert_used * 2);
-        for (uint32_t rank = om_519.n_expert_used; rank < candidate_end; ++rank) {
-            const int expert = om_519.argsort_buffer[token_offset + rank];
-            if (expert < 0 || expert >= (int) om_519.n_expert) {
-                GGML_LOG_ERROR("%s: invalid candidate expert %d for token %zu\n", __func__, expert, token);
-                return false;
-            }
-            if (expert_map[expert] != EXPERT_NOT_LOADED) {
-                replacement_experts.push_back(expert);
-            }
-        }
-
-        const size_t replacement_count = std::min(cold_positions.size(), replacement_experts.size());
-        for (size_t i = 0; i < replacement_count; ++i) {
-            const int topk = cold_positions[i];
-            const int expert = replacement_experts[i];
-            selected_topk[topk_offset + topk] = expert;
-            GGML_LOG_INFO("%s: layer=%d token=%zu expert replacement: rank %d <- expert %d\n",
-                    __func__, layer_id, token, topk, expert);
-        }
-
-        for (uint32_t topk = 0; topk < om_519.n_expert_used; ++topk) {
-            const int expert = selected_topk[topk_offset + topk];
-            if (!required[expert]) {
-                required[expert] = true;
-                ++n_required;
-                if (expert_map[expert] == EXPERT_NOT_LOADED) {
-                    missing.push_back(expert);
-                }
-            }
-        }
-    }
-
-    if (n_required > om_519.n_hot_expert) {
-        GGML_LOG_ERROR("%s: microbatch requires %zu unique experts, but the layer cache holds only %u\n",
-                __func__, n_required, om_519.n_hot_expert);
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) om_519.backend->context;
+    const ggml_vk_ssd_expert_provider & provider = ctx->ssd_expert_provider;
+    if (provider.prepare_cache == nullptr) {
+        GGML_LOG_ERROR("%s: SSD expert cache planner is not registered\n", __func__);
         return false;
     }
 
-    for (const int cur_expert_id : missing) {
-        int expert_rm_idx = -1;
-        for (int rank = om_519.n_expert - 1; rank >= (int) om_519.n_expert_used && expert_rm_idx == -1; --rank) {
-            for (size_t token = 0; token < n_tokens; ++token) {
-                const int candidate = om_519.argsort_buffer[token * om_519.n_expert + rank];
-                if (candidate < 0 || candidate >= (int) om_519.n_expert) {
-                    GGML_LOG_ERROR("%s: invalid eviction candidate %d for token %zu\n", __func__, candidate, token);
-                    return false;
-                }
-                if (!required[candidate] && expert_map[candidate] != EXPERT_NOT_LOADED) {
-                    expert_rm_idx = candidate;
-                    break;
-                }
-            }
-        }
-        if (expert_rm_idx == -1) {
-            GGML_LOG_ERROR("%s: no resident expert is available for eviction\n", __func__);
-            return false;
-        }
+    auto & expert_map = om_519.expert_map[layer_id];
+    om_519.topk_buffer.resize(n_tokens * om_519.n_expert_used);
 
-        const int slot = expert_map[expert_rm_idx];
-        if (!offload_expert_load_to_slot(layer_id, cur_expert_id, GGML_VK_SSD_EXPERT_GATE,
-                    om_519.hot_gate_tensor[layer_id], om_519.gate_info[layer_id], slot, "gate") ||
-                !offload_expert_load_to_slot(layer_id, cur_expert_id, GGML_VK_SSD_EXPERT_UP,
-                    om_519.hot_up_tensor[layer_id], om_519.up_info[layer_id], slot, "up") ||
-                !offload_expert_load_to_slot(layer_id, cur_expert_id, GGML_VK_SSD_EXPERT_DOWN,
-                    om_519.hot_down_tensor[layer_id], om_519.down_info[layer_id], slot, "down")) {
-            return false;
-        }
-
-        expert_map[cur_expert_id] = slot;
-        expert_map[expert_rm_idx] = EXPERT_NOT_LOADED;
+    ggml_vk_ssd_expert_cache_plan plan = {
+        /* .layer                = */ layer_id,
+        /* .n_hot_expert         = */ om_519.n_hot_expert,
+        /* .argsort              = */ om_519.argsort_buffer.data(),
+        /* .n_tokens             = */ n_tokens,
+        /* .expert_map           = */ expert_map.data(),
+        /* .expert_map_size      = */ expert_map.size(),
+        /* .loads                = */ om_519.cache_load_plan.data(),
+        /* .load_capacity        = */ om_519.cache_load_plan.size(),
+        /* .n_loads              = */ 0,
+        /* .mapped_topk          = */ om_519.topk_buffer.data(),
+        /* .mapped_topk_capacity = */ om_519.topk_buffer.size(),
+    };
+    const int64_t plan_start_us = ssd_timing ? ssd_expert_timing_now_us() : 0;
+    const bool cache_prepared = provider.prepare_cache(provider.user_data, &plan);
+    if (ssd_timing) {
+        ssd_expert_timing.plan_us = ssd_expert_timing_now_us() - plan_start_us;
+        ssd_expert_timing.n_loads = plan.n_loads;
+    }
+    if (!cache_prepared) {
+        return false;
     }
 
-    om_519.topk_buffer = std::move(selected_topk);
+    const int64_t load_start_us = ssd_timing ? ssd_expert_timing_now_us() : 0;
+    for (size_t i = 0; i < plan.n_loads; ++i) {
+        const auto & load = plan.loads[i];
+        if (load.expert < 0 || load.expert >= (int) om_519.n_expert ||
+                load.victim < 0 || load.victim >= (int) om_519.n_expert ||
+                expert_map[load.expert] != EXPERT_NOT_LOADED || expert_map[load.victim] != load.slot) {
+            GGML_LOG_ERROR("%s: invalid SSD expert cache load expert=%d victim=%d slot=%d\n",
+                    __func__, load.expert, load.victim, load.slot);
+            return false;
+        }
+
+        if (!offload_expert_load_to_slot(layer_id, load.expert, GGML_VK_SSD_EXPERT_GATE,
+                    om_519.hot_gate_tensor[layer_id], om_519.gate_info[layer_id], load.slot, "gate") ||
+                !offload_expert_load_to_slot(layer_id, load.expert, GGML_VK_SSD_EXPERT_UP,
+                    om_519.hot_up_tensor[layer_id], om_519.up_info[layer_id], load.slot, "up") ||
+                !offload_expert_load_to_slot(layer_id, load.expert, GGML_VK_SSD_EXPERT_DOWN,
+                    om_519.hot_down_tensor[layer_id], om_519.down_info[layer_id], load.slot, "down")) {
+            return false;
+        }
+
+        expert_map[load.expert] = load.slot;
+        expert_map[load.victim] = EXPERT_NOT_LOADED;
+    }
+    if (ssd_timing) {
+        ssd_expert_timing.expert_load_us = ssd_expert_timing_now_us() - load_start_us;
+    }
+
     return true;
 }
 
@@ -15108,21 +15215,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
         // Signal the almost_ready fence when the graph is mostly complete (< 20% remaining)
         bool almost_ready = (cgraph->n_nodes - i) < cgraph->n_nodes / 5;
-        // std::string target_str = "ffn_moe_argsort-";
-        std::string target_str = "ffn_moe_weights-";
-        std::string target_str_no = "reshaped";         
-        bool goofy_test_ffn_submit = om_519.is_inited &&
-                find_expected_node(cgraph->nodes[i], target_str) &&
-                !find_expected_node(cgraph->nodes[i], target_str_no);
-        const int ffn_weights_idx = i;
-        const int additional_fused_ops = ctx->num_additional_fused_ops;
-        //bool goofy_test_ffn_submit = false;
 
         bool submit = (submitted_nodes >= nodes_per_submit) ||
                       (mul_mat_bytes_per_submit != 0 && mul_mat_bytes >= mul_mat_bytes_per_submit) ||
                       (i + ctx->num_additional_fused_ops >= last_node) ||
-                      (almost_ready && !ctx->almost_ready_fence_pending) || 
-                      (goofy_test_ffn_submit);
+                      (almost_ready && !ctx->almost_ready_fence_pending);
 
         bool enqueued = ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx], submit_node_idx, i + ctx->num_additional_fused_ops >= last_node, almost_ready, submit);
 
@@ -15162,113 +15259,6 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         i += ctx->num_additional_fused_ops;
         ctx->num_additional_fused_ops = 0;
         ctx->fused_ops_write_mask = 0;
-
-        if(goofy_test_ffn_submit)
-        // if(0)
-        {
-
-            //node i : weights   node i+6 : ffn_moe_gate  node:i-2 experts sorted,pick top k
-            int gate_idx = i + 6;
-            int up_idx = i + 7;
-            int down_idx = i + 11;
-            // GOOFY_VK_LOG_DEBUG(ggml_get_name(cgraph->nodes[gate_idx]));
-            // GOOFY_VK_LOG_DEBUG(cgraph->nodes[gate_idx]->data);
-            // GOOFY_VK_LOG_DEBUG(ggml_get_name(cgraph->nodes[gate_idx]->src[0]));
-            // GOOFY_VK_LOG_DEBUG(ggml_nbytes(cgraph->nodes[gate_idx]->src[0]) << "bytes");
-            // GOOFY_VK_LOG_DEBUG(cgraph->nodes[gate_idx]->src[0]->data);
-            // GOOFY_VK_LOG_DEBUG(" ");
-
-            int layer_id = get_layer_id(cgraph->nodes[i]);
-
-            const int argsort_idx = i - 2;
-            if (argsort_idx < 0 || argsort_idx >= cgraph->n_nodes) {
-                GGML_LOG_ERROR("%s: invalid SSD expert argsort candidate index %d (trigger_idx=%d, current_idx=%d, fused_ops=%d, n_nodes=%d)\n",
-                        __func__, argsort_idx, ffn_weights_idx, i, additional_fused_ops, cgraph->n_nodes);
-                return GGML_STATUS_FAILED;
-            }
-
-            ggml_tensor * argsort_candidate = cgraph->nodes[argsort_idx];
-            size_t argsort_size = ggml_nbytes(argsort_candidate);
-
-            // A microbatch can have no output tokens after the final-layer output filtering.
-            // There is no expert routing or cache update to perform for this zero-row tensor.
-            if (argsort_size == 0) {
-                continue;
-            }
-
-            if (argsort_candidate->type != GGML_TYPE_I32 || argsort_candidate->ne[0] != om_519.n_expert ||
-                    argsort_candidate->ne[1] <= 0 || argsort_candidate->ne[2] != 1 || argsort_candidate->ne[3] != 1) {
-                GGML_LOG_ERROR("%s: invalid SSD expert argsort tensor type=%s ne=[%lld, %lld, %lld, %lld]\n",
-                        __func__, ggml_type_name(argsort_candidate->type), static_cast<long long>(argsort_candidate->ne[0]),
-                        static_cast<long long>(argsort_candidate->ne[1]), static_cast<long long>(argsort_candidate->ne[2]),
-                        static_cast<long long>(argsort_candidate->ne[3]));
-                return GGML_STATUS_FAILED;
-            }
-
-            const size_t n_tokens = argsort_candidate->ne[1];
-            if (n_tokens > std::numeric_limits<size_t>::max() / om_519.n_expert / sizeof(int32_t)) {
-                GGML_LOG_ERROR("%s: routed token count %zu is too large\n", __func__, n_tokens);
-                return GGML_STATUS_FAILED;
-            }
-
-            const size_t argsort_elements = n_tokens * om_519.n_expert;
-            const size_t expected_argsort_size = argsort_elements * sizeof(int32_t);
-            if (argsort_size != expected_argsort_size) {
-                GGML_LOG_ERROR("%s: SSD expert argsort size mismatch: got %zu bytes, expected %zu bytes\n",
-                        __func__, argsort_size, expected_argsort_size);
-                GGML_LOG_ERROR("%s: trigger_idx=%d trigger='%s', current_idx=%d, fused_ops=%d, candidate_idx=%d candidate='%s' op=%s type=%s ne=[%lld, %lld, %lld, %lld]\n",
-                        __func__, ffn_weights_idx, ggml_get_name(cgraph->nodes[ffn_weights_idx]), i, additional_fused_ops,
-                        argsort_idx, ggml_get_name(argsort_candidate), ggml_op_name(argsort_candidate->op),
-                        ggml_type_name(argsort_candidate->type), static_cast<long long>(argsort_candidate->ne[0]),
-                        static_cast<long long>(argsort_candidate->ne[1]), static_cast<long long>(argsort_candidate->ne[2]),
-                        static_cast<long long>(argsort_candidate->ne[3]));
-                return GGML_STATUS_FAILED;
-            }
-
-            om_519.argsort_buffer.resize(argsort_elements);
-            ggml_backend_vk_get_tensor_async(backend, argsort_candidate, om_519.argsort_buffer.data(), 0, argsort_size);
-            ggml_vk_synchronize(ctx);
-
-            if (!hot_expert_offload_process(layer_id, n_tokens)) {
-                return GGML_STATUS_FAILED;
-            }
-
-            om_519.topk_buffer.resize(n_tokens * om_519.n_expert_used);
-            for (size_t token = 0; token < n_tokens; ++token) {
-                for (uint32_t topk = 0; topk < om_519.n_expert_used; ++topk) {
-                    const int expert = om_519.topk_buffer[token * om_519.n_expert_used + topk];
-                    const int slot = om_519.expert_map[layer_id][expert];
-                    if (slot == EXPERT_NOT_LOADED) {
-                        GGML_LOG_ERROR("%s: routed expert %d is not loaded after cache update\n", __func__, expert);
-                        return GGML_STATUS_FAILED;
-                    }
-                    om_519.topk_buffer[token * om_519.n_expert_used + topk] = slot;
-                }
-            }
-
-            if (!offload_mapped_topk_resize(n_tokens)) {
-                return GGML_STATUS_FAILED;
-            }
-            ggml_backend_vk_set_tensor_async(backend, om_519.mapped_topk_tensor, om_519.topk_buffer.data(), 0,
-                    ggml_nbytes(om_519.mapped_topk_tensor));
-            ggml_vk_synchronize(ctx);
-
-            // we need to change the caculate matrix at here
-
-                // GOOFY_VK_LOG_DEBUG("before src[0] ne" << cgraph->nodes[down_idx]->src[0]->ne[0] << cgraph->nodes[down_idx]->src[0]->ne[1] << cgraph->nodes[down_idx]->src[0]->ne[2] << cgraph->nodes[down_idx]->src[0]->ne[3]);
-                // GOOFY_VK_LOG_DEBUG("before src[2] ne" << cgraph->nodes[down_idx]->src[2]->ne[0] << cgraph->nodes[down_idx]->src[2]->ne[1] << cgraph->nodes[down_idx]->src[2]->ne[2] << cgraph->nodes[down_idx]->src[2]->ne[3]);
-
-            cgraph->nodes[gate_idx]->src[0] = om_519.hot_gate_tensor[layer_id];
-            cgraph->nodes[gate_idx]->src[2] = om_519.mapped_topk_tensor;
-            cgraph->nodes[up_idx]->src[0] = om_519.hot_up_tensor[layer_id];
-            cgraph->nodes[up_idx]->src[2] = om_519.mapped_topk_tensor;
-            cgraph->nodes[down_idx]->src[0] = om_519.hot_down_tensor[layer_id];
-            cgraph->nodes[down_idx]->src[2] = om_519.mapped_topk_tensor;
-
-                // GOOFY_VK_LOG_DEBUG("after src[0] ne" << cgraph->nodes[down_idx]->src[0]->ne[0] << cgraph->nodes[down_idx]->src[0]->ne[1] << cgraph->nodes[down_idx]->src[0]->ne[2] << cgraph->nodes[down_idx]->src[0]->ne[3]);
-                // GOOFY_VK_LOG_DEBUG("after src[2] ne" << cgraph->nodes[down_idx]->src[2]->ne[0] << cgraph->nodes[down_idx]->src[2]->ne[1] << cgraph->nodes[down_idx]->src[2]->ne[2] << cgraph->nodes[down_idx]->src[2]->ne[3]);
-
-        }
     }
 
     ctx->last_total_mul_mat_bytes = total_mul_mat_bytes;
@@ -15323,6 +15313,148 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     return GGML_STATUS_SUCCESS;
 
     UNUSED(backend);
+}
+
+bool ggml_backend_vk_apply_ssd_expert_cache(
+        ggml_backend_t backend,
+        struct ggml_cgraph * cgraph,
+        int layer_id,
+        const int32_t * argsort,
+        size_t n_tokens) {
+    if (!ggml_backend_is_vk(backend) || cgraph == nullptr || argsort == nullptr || !om_519.is_inited ||
+            backend != om_519.backend || layer_id < 0 || layer_id >= (int) om_519.n_layer || n_tokens == 0) {
+        GGML_LOG_ERROR("%s: invalid SSD expert cache request\n", __func__);
+        return false;
+    }
+
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
+    const bool ssd_timing = ctx->ssd_timing.active;
+    if (ssd_timing && ctx->ssd_timing.has_pending_sync) {
+        ctx->ssd_timing.layer_sync.add(ctx->ssd_timing.pending_sync);
+        ctx->ssd_timing.has_pending_sync = false;
+    }
+    const int64_t total_start_us = ssd_timing ? ssd_expert_timing_now_us() : 0;
+
+    if (n_tokens > std::numeric_limits<size_t>::max() / om_519.n_expert) {
+        GGML_LOG_ERROR("%s: routed token count %zu is too large\n", __func__, n_tokens);
+        return false;
+    }
+
+    char gate_name[GGML_MAX_NAME];
+    char up_name[GGML_MAX_NAME];
+    char down_name[GGML_MAX_NAME];
+    snprintf(gate_name, sizeof(gate_name), "ffn_moe_gate-%d", layer_id);
+    snprintf(up_name, sizeof(up_name), "ffn_moe_up-%d", layer_id);
+    snprintf(down_name, sizeof(down_name), "ffn_moe_down-%d", layer_id);
+
+    const int gate_idx = find_named_node_index(cgraph, gate_name, GGML_OP_MUL_MAT_ID);
+    const int up_idx = find_named_node_index(cgraph, up_name, GGML_OP_MUL_MAT_ID);
+    const int down_idx = find_named_node_index(cgraph, down_name, GGML_OP_MUL_MAT_ID);
+    if (gate_idx < 0 || up_idx < 0 || down_idx < 0) {
+        GGML_LOG_ERROR("%s: incomplete SSD expert compute nodes for layer %d: gate=%d up=%d down=%d\n",
+                __func__, layer_id, gate_idx, up_idx, down_idx);
+        return false;
+    }
+
+    const size_t argsort_elements = n_tokens * om_519.n_expert;
+    om_519.argsort_buffer.assign(argsort, argsort + argsort_elements);
+
+    if (!hot_expert_offload_process(layer_id, n_tokens) || !offload_mapped_topk_resize(n_tokens)) {
+        return false;
+    }
+
+    const int64_t mapped_start_us = ssd_timing ? ssd_expert_timing_now_us() : 0;
+    ggml_backend_vk_set_tensor_async(backend, om_519.mapped_topk_tensor, om_519.topk_buffer.data(), 0,
+            ggml_nbytes(om_519.mapped_topk_tensor));
+    ggml_vk_synchronize(ctx);
+    const int64_t mapped_us = ssd_timing ? ssd_expert_timing_now_us() - mapped_start_us : 0;
+
+    cgraph->nodes[gate_idx]->src[0] = om_519.hot_gate_tensor[layer_id];
+    cgraph->nodes[gate_idx]->src[2] = om_519.mapped_topk_tensor;
+    cgraph->nodes[up_idx]->src[0] = om_519.hot_up_tensor[layer_id];
+    cgraph->nodes[up_idx]->src[2] = om_519.mapped_topk_tensor;
+    cgraph->nodes[down_idx]->src[0] = om_519.hot_down_tensor[layer_id];
+    cgraph->nodes[down_idx]->src[2] = om_519.mapped_topk_tensor;
+
+    if (ssd_timing) {
+        const int64_t total_us = ssd_expert_timing_now_us() - total_start_us;
+        auto & cache = ctx->ssd_timing.cache;
+        ++cache.layers;
+        cache.loads += ssd_expert_timing.n_loads;
+        cache.plan_us += ssd_expert_timing.plan_us;
+        cache.expert_load_us += ssd_expert_timing.expert_load_us;
+        cache.mapped_upload_us += mapped_us;
+        cache.total_us += total_us;
+    }
+
+    return true;
+}
+
+bool ggml_backend_vk_ssd_timing_begin(
+        ggml_backend_t backend,
+        bool prefill,
+        size_t n_tokens) {
+    if (!ssd_expert_timing_enabled() || !ggml_backend_is_vk(backend)) {
+        return false;
+    }
+
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
+    ctx->ssd_timing = {};
+    ctx->ssd_timing.active = true;
+    ctx->ssd_timing.prefill = prefill;
+    ctx->ssd_timing.n_tokens = n_tokens;
+    return true;
+}
+
+static void ggml_backend_vk_ssd_timing_print_sync(
+        const char * phase,
+        const char * scope,
+        const ssd_vk_sync_timing_summary & timing) {
+    GGML_LOG_INFO("[SSD_TIMING][vulkan_sync][%s][%s] calls=%zu transfer_work=%zu compute_work=%zu waited=%zu "
+            "transfer_submit=%.3f ms compute_submit=%.3f ms fence_submit=%.3f ms "
+            "fence_wait=%.3f ms output_copy=%.3f ms cleanup=%.3f ms other=%.3f ms total=%.3f ms\n",
+            phase, scope, timing.calls, timing.transfer_work, timing.compute_work, timing.waited,
+            timing.transfer_submit_us / 1000.0, timing.compute_submit_us / 1000.0,
+            timing.fence_submit_us / 1000.0, timing.fence_wait_us / 1000.0,
+            timing.output_copy_us / 1000.0, timing.cleanup_us / 1000.0,
+            timing.other_us / 1000.0, timing.total_us / 1000.0);
+}
+
+bool ggml_backend_vk_ssd_timing_end(ggml_backend_t backend) {
+    if (!ggml_backend_is_vk(backend)) {
+        return false;
+    }
+
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
+    auto & timing = ctx->ssd_timing;
+    if (!timing.active) {
+        return false;
+    }
+    if (timing.has_pending_sync) {
+        timing.standalone_sync.add(timing.pending_sync);
+        timing.has_pending_sync = false;
+    }
+    timing.active = false;
+
+    if (timing.cache.layers == 0) {
+        return false;
+    }
+
+    const char * phase = timing.prefill ? "prefill" : "decode";
+    ggml_backend_vk_ssd_timing_print_sync(phase, "general", timing.standalone_sync);
+    ggml_backend_vk_ssd_timing_print_sync(phase, "layer", timing.layer_sync);
+
+    const int64_t cache_measured_us = timing.cache.plan_us + timing.cache.expert_load_us +
+            timing.cache.mapped_upload_us;
+    const int64_t cache_other_us = timing.cache.total_us > cache_measured_us ?
+            timing.cache.total_us - cache_measured_us : 0;
+    GGML_LOG_INFO("[SSD_TIMING][vulkan][%s][layer] tokens=%zu layers=%zu loads=%zu "
+            "plan=%.3f ms expert_load=%.3f ms mapped_upload=%.3f ms other=%.3f ms total=%.3f ms\n",
+            phase, timing.n_tokens, timing.cache.layers, timing.cache.loads,
+            timing.cache.plan_us / 1000.0, timing.cache.expert_load_us / 1000.0,
+            timing.cache.mapped_upload_us / 1000.0, cache_other_us / 1000.0,
+            timing.cache.total_us / 1000.0);
+    return true;
 }
 
 // Sort the graph for improved parallelism.
@@ -15633,6 +15765,7 @@ static ggml_backend_i ggml_backend_vk_interface = {
     /* .event_record            = */ ggml_backend_vk_event_record,
     /* .event_wait              = */ ggml_backend_vk_event_wait,
     /* .graph_optimize          = */ ggml_vk_graph_optimize,
+    /* .synchronize_intermediate = */ ggml_backend_vk_synchronize_intermediate,
 };
 
 static ggml_guid_t ggml_backend_vk_guid() {

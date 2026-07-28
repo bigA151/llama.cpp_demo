@@ -10,6 +10,7 @@
 #include "ggml-opt.h"
 
 #include <map>
+#include <set>
 #include <vector>
 
 struct llama_model;
@@ -124,7 +125,8 @@ struct llama_context {
                 const llama_ubatch & ubatch,
                     llm_graph_type   gtype,
             llama_memory_context_i * mctx,
-                       ggml_status & ret);
+                       ggml_status & ret,
+                              bool   ssd_timing_prefill);
 
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
@@ -243,6 +245,9 @@ private:
 
     llm_graph_cb graph_get_cb() const;
 
+    static bool eval_callback_trampoline(ggml_tensor * tensor, bool ask, void * user_data);
+    bool eval_callback(ggml_tensor * tensor, bool ask);
+
     // TODO: read/write lora adapters and cvec
     size_t state_write_data(llama_io_write_i & io);
     size_t state_read_data (llama_io_read_i  & io);
@@ -310,6 +315,14 @@ private:
     std::vector<swap_info> output_swaps;
 
     ggml_backend_sched_ptr sched;
+
+    ggml_cgraph * eval_graph = nullptr;
+    std::set<ggml_tensor *> eval_callback_user_requested;
+    std::vector<int32_t> ssd_expert_argsort;
+    bool ssd_expert_cache_enabled = false;
+    bool ssd_expert_cache_failed  = false;
+    bool ssd_timing_prefill_done  = false;
+    bool ssd_timing_decode_done   = false;
 
     bool sched_need_reserve = true;
 
