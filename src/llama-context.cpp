@@ -17,6 +17,7 @@
 
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -87,12 +88,117 @@ static bool llama_vk_ssd_expert_get_tensor_info(
     return false;
 }
 
-static void llama_vk_register_ssd_expert_provider(
+static bool llama_vk_ssd_expert_prepare_cache(
+        void * user_data,
+        ggml_vk_ssd_expert_cache_plan * plan) {
+    const llama_model * model = static_cast<const llama_model *>(user_data);
+    if (model == nullptr || plan == nullptr) {
+        return false;
+    }
+
+    const uint32_t n_layer       = model->hparams.n_layer - model->hparams.nextn_predict_layers;
+    const uint32_t n_expert      = model->hparams.n_expert;
+    const uint32_t n_expert_used = model->hparams.n_expert_used;
+    const int32_t expert_not_loaded = -1;
+
+    plan->n_loads = 0;
+    if (plan->layer < 0 || plan->layer >= (int) n_layer || plan->n_hot_expert < n_expert_used ||
+            plan->n_hot_expert > n_expert || plan->n_tokens == 0 || plan->argsort == nullptr ||
+            plan->expert_map == nullptr || plan->expert_map_size != n_expert) {
+        LLAMA_LOG_ERROR("%s: invalid SSD expert cache request\n", __func__);
+        return false;
+    }
+
+    if (plan->n_tokens > std::numeric_limits<size_t>::max() / n_expert ||
+            plan->n_tokens * n_expert_used > plan->mapped_topk_capacity ||
+            plan->mapped_topk == nullptr || plan->load_capacity < n_expert || plan->loads == nullptr) {
+        LLAMA_LOG_ERROR("%s: insufficient SSD expert cache plan storage\n", __func__);
+        return false;
+    }
+
+    std::vector<bool> required(n_expert, false);
+    std::vector<int32_t> missing;
+    size_t n_required = 0;
+
+    for (size_t token = 0; token < plan->n_tokens; ++token) {
+        const size_t token_offset = token * n_expert;
+        for (uint32_t topk = 0; topk < n_expert_used; ++topk) {
+            const int expert = plan->argsort[token_offset + topk];
+            if (expert < 0 || expert >= (int) n_expert) {
+                LLAMA_LOG_ERROR("%s: invalid routed expert %d for token %zu\n", __func__, expert, token);
+                return false;
+            }
+
+            if (!required[expert]) {
+                required[expert] = true;
+                ++n_required;
+                if (plan->expert_map[expert] == expert_not_loaded) {
+                    missing.push_back(expert);
+                }
+            }
+        }
+    }
+
+    if (n_required > plan->n_hot_expert) {
+        LLAMA_LOG_ERROR("%s: microbatch requires %zu unique experts, but the layer cache holds only %u\n",
+                __func__, n_required, plan->n_hot_expert);
+        return false;
+    }
+
+    std::vector<int32_t> next_map(plan->expert_map, plan->expert_map + n_expert);
+    for (const int cur_expert_id : missing) {
+        int expert_rm_idx = -1;
+        for (int rank = n_expert - 1; rank >= (int) n_expert_used && expert_rm_idx == -1; --rank) {
+            for (size_t token = 0; token < plan->n_tokens; ++token) {
+                const int candidate = plan->argsort[token * n_expert + rank];
+                if (candidate < 0 || candidate >= (int) n_expert) {
+                    LLAMA_LOG_ERROR("%s: invalid eviction candidate %d for token %zu\n", __func__, candidate, token);
+                    return false;
+                }
+                if (!required[candidate] && next_map[candidate] != expert_not_loaded) {
+                    expert_rm_idx = candidate;
+                    break;
+                }
+            }
+        }
+
+        if (expert_rm_idx == -1) {
+            LLAMA_LOG_ERROR("%s: no resident expert is available for eviction\n", __func__);
+            return false;
+        }
+
+        const int slot = next_map[expert_rm_idx];
+        if (slot < 0 || slot >= (int) plan->n_hot_expert || plan->n_loads >= plan->load_capacity) {
+            LLAMA_LOG_ERROR("%s: invalid SSD expert cache slot %d\n", __func__, slot);
+            return false;
+        }
+
+        plan->loads[plan->n_loads++] = { cur_expert_id, expert_rm_idx, slot };
+        next_map[cur_expert_id] = slot;
+        next_map[expert_rm_idx] = expert_not_loaded;
+    }
+
+    for (size_t token = 0; token < plan->n_tokens; ++token) {
+        for (uint32_t topk = 0; topk < n_expert_used; ++topk) {
+            const int expert = plan->argsort[token * n_expert + topk];
+            const int slot = next_map[expert];
+            if (slot == expert_not_loaded) {
+                LLAMA_LOG_ERROR("%s: routed expert %d is not mapped after cache planning\n", __func__, expert);
+                return false;
+            }
+            plan->mapped_topk[token * n_expert_used + topk] = slot;
+        }
+    }
+
+    return true;
+}
+
+static bool llama_vk_register_ssd_expert_provider(
         const llama_model & model,
         ggml_backend_t backend,
         uint32_t n_hot_expert) {
     if (model.arch != LLM_ARCH_QWEN35MOE || !ggml_backend_is_vk(backend) || model.ssd_expert_addrs().empty()) {
-        return;
+        return false;
     }
 
     if (n_hot_expert < model.hparams.n_expert_used || n_hot_expert > model.hparams.n_expert) {
@@ -104,14 +210,116 @@ static void llama_vk_register_ssd_expert_provider(
         /* .user_data        = */ const_cast<llama_model *>(&model),
         /* .read             = */ llama_vk_ssd_expert_read,
         /* .get_tensor_info  = */ llama_vk_ssd_expert_get_tensor_info,
+        /* .prepare_cache    = */ llama_vk_ssd_expert_prepare_cache,
         /* .n_layer          = */ model.hparams.n_layer - model.hparams.nextn_predict_layers,
         /* .n_expert         = */ model.hparams.n_expert,
         /* .n_expert_used    = */ model.hparams.n_expert_used,
         /* .n_hot_expert     = */ n_hot_expert,
     };
     ggml_backend_vk_set_ssd_expert_provider(backend, &provider);
+    return true;
+}
+
+static bool llama_ssd_expert_argsort_layer(const ggml_tensor * tensor, int & layer) {
+    static constexpr char prefix[] = "ffn_moe_argsort-";
+
+    if (tensor == nullptr || tensor->op != GGML_OP_ARGSORT) {
+        return false;
+    }
+
+    const char * name = ggml_get_name(tensor);
+    if (strncmp(name, prefix, sizeof(prefix) - 1) != 0) {
+        return false;
+    }
+
+    char * end = nullptr;
+    const long parsed = strtol(name + sizeof(prefix) - 1, &end, 10);
+    if (end == name + sizeof(prefix) - 1 || *end != '\0' || parsed < 0 || parsed > std::numeric_limits<int>::max()) {
+        return false;
+    }
+
+    layer = (int) parsed;
+    return true;
 }
 #endif
+
+bool llama_context::eval_callback_trampoline(ggml_tensor * tensor, bool ask, void * user_data) {
+    llama_context * ctx = static_cast<llama_context *>(user_data);
+    return ctx != nullptr && ctx->eval_callback(tensor, ask);
+}
+
+bool llama_context::eval_callback(ggml_tensor * tensor, bool ask) {
+    bool user_requested = false;
+    if (cparams.cb_eval != nullptr && ask) {
+        user_requested = cparams.cb_eval(tensor, true, cparams.cb_eval_user_data);
+        if (user_requested) {
+            eval_callback_user_requested.insert(tensor);
+        }
+    }
+
+    bool cache_requested = false;
+    int layer = -1;
+#ifdef GGML_USE_VULKAN
+    cache_requested = ssd_expert_cache_enabled && llama_ssd_expert_argsort_layer(tensor, layer) &&
+            ggml_nbytes(tensor) > 0;
+    ggml_backend_t cache_backend = cache_requested ?
+            ggml_backend_sched_get_tensor_backend(sched.get(), tensor) : nullptr;
+    cache_requested = cache_requested && ggml_backend_is_vk(cache_backend);
+#endif
+
+    if (ask) {
+        return user_requested || cache_requested;
+    }
+
+    bool keep_going = true;
+#ifdef GGML_USE_VULKAN
+    if (cache_requested) {
+        const uint32_t n_expert = model.hparams.n_expert;
+        if (eval_graph == nullptr || tensor->type != GGML_TYPE_I32 || tensor->ne[0] != n_expert ||
+                tensor->ne[1] <= 0 || tensor->ne[2] != 1 || tensor->ne[3] != 1 ||
+                layer >= (int) (model.hparams.n_layer - model.hparams.nextn_predict_layers)) {
+            LLAMA_LOG_ERROR("%s: invalid SSD expert argsort tensor '%s' type=%s ne=[%lld, %lld, %lld, %lld]\n",
+                    __func__, ggml_get_name(tensor), ggml_type_name(tensor->type),
+                    static_cast<long long>(tensor->ne[0]), static_cast<long long>(tensor->ne[1]),
+                    static_cast<long long>(tensor->ne[2]), static_cast<long long>(tensor->ne[3]));
+            ssd_expert_cache_failed = true;
+            keep_going = false;
+        } else {
+            const size_t n_tokens = tensor->ne[1];
+            if (n_tokens > std::numeric_limits<size_t>::max() / n_expert / sizeof(int32_t)) {
+                LLAMA_LOG_ERROR("%s: routed token count %zu is too large\n", __func__, n_tokens);
+                ssd_expert_cache_failed = true;
+                keep_going = false;
+            } else {
+                const size_t n_elements = n_tokens * n_expert;
+                const size_t n_bytes = n_elements * sizeof(int32_t);
+                if (ggml_nbytes(tensor) != n_bytes) {
+                    LLAMA_LOG_ERROR("%s: SSD expert argsort size mismatch: got %zu bytes, expected %zu bytes\n",
+                            __func__, ggml_nbytes(tensor), n_bytes);
+                    ssd_expert_cache_failed = true;
+                    keep_going = false;
+                } else {
+                    ssd_expert_argsort.resize(n_elements);
+                    ggml_backend_tensor_get(tensor, ssd_expert_argsort.data(), 0, n_bytes);
+                    const bool cache_applied = ggml_backend_vk_apply_ssd_expert_cache(
+                            cache_backend, eval_graph, layer, ssd_expert_argsort.data(), n_tokens);
+                    if (!cache_applied) {
+                        LLAMA_LOG_ERROR("%s: failed to apply SSD expert cache for layer %d\n", __func__, layer);
+                        ssd_expert_cache_failed = true;
+                        keep_going = false;
+                    }
+                }
+            }
+        }
+    }
+#endif
+
+    if (eval_callback_user_requested.erase(tensor) > 0 && cparams.cb_eval != nullptr) {
+        keep_going = cparams.cb_eval(tensor, false, cparams.cb_eval_user_data) && keep_going;
+    }
+
+    return keep_going;
+}
 
 llama_context::llama_context(
         const llama_model & model,
@@ -361,7 +569,8 @@ llama_context::llama_context(
 
 #ifdef GGML_USE_VULKAN
         for (auto & backend : backends) {
-            llama_vk_register_ssd_expert_provider(model, backend.get(), params.n_ssd_expert_cache);
+            ssd_expert_cache_enabled |= llama_vk_register_ssd_expert_provider(
+                    model, backend.get(), params.n_ssd_expert_cache);
         }
 #endif
 
@@ -1295,7 +1504,12 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
-llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+llm_graph_result * llama_context::process_ubatch(
+        const llama_ubatch & ubatch,
+        llm_graph_type gtype,
+        llama_memory_context_i * mctx,
+        ggml_status & ret,
+        bool ssd_timing_prefill) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1324,7 +1538,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
-        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        ggml_backend_sched_set_eval_callback(
+                sched.get(),
+                (ssd_expert_cache_enabled || cparams.cb_eval != nullptr) ? eval_callback_trampoline : nullptr,
+                this);
 
         //const auto t_start_us = ggml_time_us();
 
@@ -1345,6 +1562,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
     }
 
+#ifdef GGML_USE_VULKAN
+    bool ssd_timing_capture = false;
+    const bool ssd_timing_done = ssd_timing_prefill ? ssd_timing_prefill_done : ssd_timing_decode_done;
+    if (ssd_expert_cache_enabled && !ssd_timing_done) {
+        for (const auto & backend : backends) {
+            if (ggml_backend_is_vk(backend.get())) {
+                ssd_timing_capture |= ggml_backend_vk_ssd_timing_begin(
+                        backend.get(), ssd_timing_prefill, ubatch.n_tokens);
+            }
+        }
+    }
+#endif
+
     // set the input data for the input tensors
     {
         //const auto t_start_us = ggml_time_us();
@@ -1356,6 +1586,25 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+
+#ifdef GGML_USE_VULKAN
+    if (ssd_timing_capture) {
+        bool ssd_timing_printed = false;
+        for (const auto & backend : backends) {
+            if (ggml_backend_is_vk(backend.get())) {
+                ssd_timing_printed |= ggml_backend_vk_ssd_timing_end(backend.get());
+            }
+        }
+        if (ssd_timing_printed) {
+            if (ssd_timing_prefill) {
+                ssd_timing_prefill_done = true;
+            } else {
+                ssd_timing_decode_done = true;
+            }
+        }
+    }
+#endif
+
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -1426,7 +1675,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
     cparams.causal_attn = false;
 
     ggml_status status;
-    const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_ENCODER, nullptr, status);
+    const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_ENCODER, nullptr, status, false);
 
     cparams.causal_attn = causal_attn_org;
 
@@ -1816,7 +2065,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         ggml_status status;
-        const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_DECODER, mctx.get(), status);
+        const auto * res = process_ubatch(
+                ubatch, LLM_GRAPH_TYPE_DECODER, mctx.get(), status, n_tokens_all > 1);
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -2315,7 +2565,16 @@ ggml_status llama_context::graph_compute(
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
 
+    eval_graph = gf;
+    ssd_expert_cache_failed = false;
+    eval_callback_user_requested.clear();
+
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
+    eval_graph = nullptr;
+
+    if (status == GGML_STATUS_SUCCESS && ssd_expert_cache_failed) {
+        status = GGML_STATUS_FAILED;
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }

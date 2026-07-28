@@ -1376,9 +1376,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     // select experts
     //probs/selection_probs：各token对于每个专家的评分  selected_experts：各token选出的top-K(n_expert_used)个专家id
+    //ggml_argsort_top_k函数干了两件事:一是对各token的每个专家评分进行排序(输出专家序号，后cb为ffn_moe_argsort),二是只保留前top-K个专家id(后cb为ffn_moe_topk)
     ggml_tensor * selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
-    cb(selected_experts->src[0], "ffn_moe_argsort", il);
-    cb(selected_experts, "ffn_moe_topk", il);
+    cb(selected_experts->src[0], "ffn_moe_argsort", il);//各token的专家完整排序结果
+    cb(selected_experts, "ffn_moe_topk", il);//各token的前top-K排序结果(即完整结果前top-K位)
 
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
         // TODO: Use scalar div instead when/if implemented
