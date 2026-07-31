@@ -14676,6 +14676,37 @@ static bool hot_expert_offload_process(int layer_id) {
     }
 
     auto & expert_map = om_519.expert_map[layer_id];
+
+    // If the next expert after the selected top-k is already resident, use it
+    // instead of loading the lowest-ranked non-resident top-k expert.
+    int replacement_pos = -1;
+    int replacement_expert = -1;
+    if (om_519.n_expert_used < om_519.n_expert) {
+        replacement_expert = om_519.argsort_buffer[om_519.n_expert_used];
+        if (replacement_expert < 0 || replacement_expert >= (int) om_519.n_expert) {
+            GGML_LOG_ERROR("%s: invalid ninth-ranked expert %d\n", __func__, replacement_expert);
+            return false;
+        }
+
+        if (expert_map[replacement_expert] != EXPERT_NOT_LOADED) {
+            for (int i = (int) om_519.n_expert_used - 1; i >= 0; --i) {
+                const int expert_id = om_519.argsort_buffer[i];
+                if (expert_id < 0 || expert_id >= (int) om_519.n_expert) {
+                    GGML_LOG_ERROR("%s: invalid routed expert %d\n", __func__, expert_id);
+                    return false;
+                }
+                if (expert_map[expert_id] == EXPERT_NOT_LOADED) {
+                    replacement_pos = i;
+                    break;
+                }
+            }
+        }
+    }
+
+    const auto selected_expert_id = [&](uint32_t rank) {
+        return (int) rank == replacement_pos ? replacement_expert : om_519.argsort_buffer[rank];
+    };
+
     for (uint32_t i = 0; i < om_519.n_expert_used; ++i) {
         const int cur_expert_id = om_519.argsort_buffer[i];
         if (cur_expert_id < 0 || cur_expert_id >= (int) om_519.n_expert) {
