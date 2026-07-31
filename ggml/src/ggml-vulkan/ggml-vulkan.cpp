@@ -14677,38 +14677,55 @@ static bool hot_expert_offload_process(int layer_id) {
 
     auto & expert_map = om_519.expert_map[layer_id];
 
-    // If the next expert after the selected top-k is already resident, use it
-    // instead of loading the lowest-ranked non-resident top-k expert.
-    int replacement_pos = -1;
-    int replacement_expert = -1;
-    if (om_519.n_expert_used < om_519.n_expert) {
-        replacement_expert = om_519.argsort_buffer[om_519.n_expert_used];
-        if (replacement_expert < 0 || replacement_expert >= (int) om_519.n_expert) {
-            GGML_LOG_ERROR("%s: invalid ninth-ranked expert %d\n", __func__, replacement_expert);
+    GGML_LOG_DEBUG("%s: layer=%d n_expert=%u n_expert_used=%u n_hot_expert=%u\n",
+        __func__, layer_id, om_519.n_expert, om_519.n_expert_used, om_519.n_hot_expert);
+    // Consider the next top-k experts after the selected set.  For
+    // Qwen3.5MoE this is ranks 9 through 16.
+    std::vector<int32_t> selected_experts(om_519.n_expert_used);
+    std::vector<int32_t> cold_positions;
+    std::vector<int32_t> replacement_experts;
+
+    for (uint32_t i = 0; i < om_519.n_expert_used; ++i) {
+        const int expert_id = om_519.argsort_buffer[i];
+        if (expert_id < 0 || expert_id >= (int) om_519.n_expert) {
+            GGML_LOG_ERROR("%s: invalid routed expert %d\n", __func__, expert_id);
             return false;
         }
+        selected_experts[i] = expert_id;
+    }
 
-        if (expert_map[replacement_expert] != EXPERT_NOT_LOADED) {
-            for (int i = (int) om_519.n_expert_used - 1; i >= 0; --i) {
-                const int expert_id = om_519.argsort_buffer[i];
-                if (expert_id < 0 || expert_id >= (int) om_519.n_expert) {
-                    GGML_LOG_ERROR("%s: invalid routed expert %d\n", __func__, expert_id);
-                    return false;
-                }
-                if (expert_map[expert_id] == EXPERT_NOT_LOADED) {
-                    replacement_pos = i;
-                    break;
-                }
-            }
+    // Record cold top-k positions from lowest to highest route score.
+    for (int i = (int) om_519.n_expert_used - 1; i >= 0; --i) {
+        if (expert_map[selected_experts[i]] == EXPERT_NOT_LOADED) {
+            cold_positions.push_back(i);
         }
     }
 
-    const auto selected_expert_id = [&](uint32_t rank) {
-        return (int) rank == replacement_pos ? replacement_expert : om_519.argsort_buffer[rank];
+    const uint32_t candidate_end = std::min(om_519.n_expert, om_519.n_expert_used * 2);
+    for (uint32_t i = om_519.n_expert_used; i < candidate_end; ++i) {
+        const int expert_id = om_519.argsort_buffer[i];
+        if (expert_id < 0 || expert_id >= (int) om_519.n_expert) {
+            GGML_LOG_ERROR("%s: invalid candidate expert %d\n", __func__, expert_id);
+            return false;
+        }
+        if (expert_map[expert_id] != EXPERT_NOT_LOADED) {
+            replacement_experts.push_back(expert_id);
+        }
+    }
+
+    const size_t replacement_count = std::min(cold_positions.size(), replacement_experts.size());
+    for (size_t i = 0; i < replacement_count; ++i) {
+        selected_experts[cold_positions[i]] = replacement_experts[i];
+        GGML_LOG_INFO("%s: layer=%d expert replacement: rank %d <- expert %d\n",
+            __func__, layer_id, cold_positions[i], replacement_experts[i]);
+    }
+
+    const auto is_selected_expert = [&](int expert_id) {
+        return std::find(selected_experts.begin(), selected_experts.end(), expert_id) != selected_experts.end();
     };
 
     for (uint32_t i = 0; i < om_519.n_expert_used; ++i) {
-        const int cur_expert_id = om_519.argsort_buffer[i];
+        const int cur_expert_id = selected_experts[i];
         if (cur_expert_id < 0 || cur_expert_id >= (int) om_519.n_expert) {
             GGML_LOG_ERROR("%s: invalid routed expert %d\n", __func__, cur_expert_id);
             return false;
@@ -14720,7 +14737,8 @@ static bool hot_expert_offload_process(int layer_id) {
         int expert_rm_idx = -1;
         for (int rm_pos_idx = om_519.n_expert - 1; rm_pos_idx >= 0; --rm_pos_idx) {
             const int candidate = om_519.argsort_buffer[rm_pos_idx];
-            if (candidate >= 0 && candidate < (int) om_519.n_expert && expert_map[candidate] != EXPERT_NOT_LOADED) {
+            if (candidate >= 0 && candidate < (int) om_519.n_expert && !is_selected_expert(candidate) &&
+                    expert_map[candidate] != EXPERT_NOT_LOADED) {
                 expert_rm_idx = candidate;
                 break;
             }
@@ -14743,6 +14761,8 @@ static bool hot_expert_offload_process(int layer_id) {
         expert_map[cur_expert_id] = slot;
         expert_map[expert_rm_idx] = EXPERT_NOT_LOADED;
     }
+
+    std::copy(selected_experts.begin(), selected_experts.end(), om_519.argsort_buffer.begin());
 
     return true;
 }
