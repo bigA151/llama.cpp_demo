@@ -14715,6 +14715,58 @@ static bool hot_expert_offload_process(int layer_id, size_t n_tokens) {
     }
 
     auto & expert_map = om_519.expert_map[layer_id];
+
+    GGML_LOG_DEBUG("%s: layer=%d n_expert=%u n_expert_used=%u n_hot_expert=%u\n",
+        __func__, layer_id, om_519.n_expert, om_519.n_expert_used, om_519.n_hot_expert);
+
+    // Consider the next top-k experts after the selected set. For
+    // Qwen3.5MoE this is ranks 9 through 16.
+    const uint32_t candidate_end = std::min(om_519.n_expert, om_519.n_expert_used * 2);
+    for (size_t token = 0; token < n_tokens; ++token) {
+        const size_t token_offset = token * om_519.n_expert;
+        std::vector<int32_t> selected_experts(om_519.n_expert_used);
+        std::vector<int32_t> cold_positions;
+        std::vector<int32_t> replacement_experts;
+
+        for (uint32_t topk = 0; topk < om_519.n_expert_used; ++topk) {
+            const int expert_id = om_519.argsort_buffer[token_offset + topk];
+            if (expert_id < 0 || expert_id >= (int) om_519.n_expert) {
+                GGML_LOG_ERROR("%s: invalid routed expert %d for token %zu\n", __func__, expert_id, token);
+                return false;
+            }
+            selected_experts[topk] = expert_id;
+        }
+
+        // Record cold top-k positions from lowest to highest route score.
+        for (int topk = (int) om_519.n_expert_used - 1; topk >= 0; --topk) {
+            if (expert_map[selected_experts[topk]] == EXPERT_NOT_LOADED) {
+                cold_positions.push_back(topk);
+            }
+        }
+
+        for (uint32_t rank = om_519.n_expert_used; rank < candidate_end; ++rank) {
+            const int expert_id = om_519.argsort_buffer[token_offset + rank];
+            if (expert_id < 0 || expert_id >= (int) om_519.n_expert) {
+                GGML_LOG_ERROR("%s: invalid candidate expert %d for token %zu\n", __func__, expert_id, token);
+                return false;
+            }
+            if (expert_map[expert_id] != EXPERT_NOT_LOADED) {
+                replacement_experts.push_back(expert_id);
+            }
+        }
+
+        const size_t replacement_count = std::min(cold_positions.size(), replacement_experts.size());
+        for (size_t i = 0; i < replacement_count; ++i) {
+            selected_experts[cold_positions[i]] = replacement_experts[i];
+            GGML_LOG_INFO("%s: layer=%d token=%zu expert replacement: rank %d <- expert %d\n",
+                __func__, layer_id, token, cold_positions[i], replacement_experts[i]);
+        }
+
+        for (uint32_t topk = 0; topk < om_519.n_expert_used; ++topk) {
+            om_519.argsort_buffer[token_offset + topk] = selected_experts[topk];
+        }
+    }
+
     std::vector<bool> required(om_519.n_expert, false);
     std::vector<int> missing;
     size_t n_required = 0;
