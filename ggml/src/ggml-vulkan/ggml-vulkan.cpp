@@ -14731,7 +14731,7 @@ static bool hot_expert_offload_process(int layer_id, size_t n_tokens) {
         for (uint32_t topk = 0; topk < om_519.n_expert_used; ++topk) {
             const int expert_id = om_519.argsort_buffer[token_offset + topk];
             if (expert_id < 0 || expert_id >= (int) om_519.n_expert) {
-                GGML_LOG_ERROR("%s: invalid routed expert %d for token %zu\n", __func__, expert_id, token);
+                //GGML_LOG_ERROR("%s: invalid routed expert %d for token %zu\n", __func__, expert_id, token);
                 return false;
             }
             selected_experts[topk] = expert_id;
@@ -14747,7 +14747,7 @@ static bool hot_expert_offload_process(int layer_id, size_t n_tokens) {
         for (uint32_t rank = om_519.n_expert_used; rank < candidate_end; ++rank) {
             const int expert_id = om_519.argsort_buffer[token_offset + rank];
             if (expert_id < 0 || expert_id >= (int) om_519.n_expert) {
-                GGML_LOG_ERROR("%s: invalid candidate expert %d for token %zu\n", __func__, expert_id, token);
+                //GGML_LOG_ERROR("%s: invalid candidate expert %d for token %zu\n", __func__, expert_id, token);
                 return false;
             }
             if (expert_map[expert_id] != EXPERT_NOT_LOADED) {
@@ -14758,8 +14758,8 @@ static bool hot_expert_offload_process(int layer_id, size_t n_tokens) {
         const size_t replacement_count = std::min(cold_positions.size(), replacement_experts.size());
         for (size_t i = 0; i < replacement_count; ++i) {
             selected_experts[cold_positions[i]] = replacement_experts[i];
-            GGML_LOG_INFO("%s: layer=%d token=%zu expert replacement: rank %d <- expert %d\n",
-                __func__, layer_id, token, cold_positions[i], replacement_experts[i]);
+            //GGML_LOG_INFO("%s: layer=%d token=%zu expert replacement: rank %d <- expert %d\n",
+//                __func__, layer_id, token, cold_positions[i], replacement_experts[i]);
         }
 
         for (uint32_t topk = 0; topk < om_519.n_expert_used; ++topk) {
