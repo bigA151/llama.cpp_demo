@@ -14445,6 +14445,9 @@ typedef struct {
     std::vector<ggml_backend_buffer_t> offload_up_exps_buffer;
     std::vector<ggml_backend_buffer_t> offload_gate_exps_buffer;
     std::vector<std::vector<int32_t>> expert_map;
+    std::vector<std::vector<uint64_t>> expert_last_access;
+    std::vector<std::vector<uint32_t>> expert_access_count;
+    std::vector<uint64_t> layer_steps;
 
     struct ggml_context * offload_ctx; //need a ctx to create tensors
 
@@ -14688,6 +14691,10 @@ static bool offload_expert_buffer_manager_init(ggml_backend_t backend) {
     om_519.up_info.resize(n_layer);
     om_519.down_info.resize(n_layer);
     om_519.expert_map.assign(n_layer, std::vector<int32_t>(provider.n_expert, EXPERT_NOT_LOADED));
+    om_519.expert_last_access.assign(n_layer, std::vector<uint64_t>(
+                provider.n_expert, std::numeric_limits<uint64_t>::max()));
+    om_519.expert_access_count.assign(n_layer, std::vector<uint32_t>(provider.n_expert, 0));
+    om_519.layer_steps.assign(n_layer, 0);
     om_519.argsort_buffer.resize(provider.n_expert);
     om_519.topk_buffer.resize(provider.n_expert_used);
 
@@ -14698,6 +14705,81 @@ static bool offload_expert_buffer_manager_init(ggml_backend_t backend) {
 
     om_519.is_inited = true;
     return true;
+}
+
+static uint64_t offload_expert_access_age(
+        const std::vector<uint64_t> & last_access,
+        uint64_t step,
+        int expert) {
+    const uint64_t never_accessed = std::numeric_limits<uint64_t>::max();
+    if (last_access[expert] == never_accessed) {
+        return step + 1;
+    }
+
+    return step >= last_access[expert] ? step - last_access[expert] + 1 : 1;
+}
+
+static int offload_expert_select_victim(
+        int layer_id,
+        const std::vector<bool> & required,
+        const std::vector<int32_t> & eviction_rank) {
+    auto & expert_map   = om_519.expert_map[layer_id];
+    auto & last_access  = om_519.expert_last_access[layer_id];
+    auto & access_count = om_519.expert_access_count[layer_id];
+
+    const uint64_t step = om_519.layer_steps[layer_id];
+
+    int expert_rm_idx = -1;
+    int32_t best_rank_value = -1;
+    uint64_t best_age = 0;
+    uint32_t best_frequency = std::numeric_limits<uint32_t>::max();
+
+    for (uint32_t expert = 0; expert < om_519.n_expert; ++expert) {
+        if (required[expert] || expert_map[expert] == EXPERT_NOT_LOADED) {
+            continue;
+        }
+
+        const int32_t rank_value = eviction_rank[expert];
+        const uint64_t age = offload_expert_access_age(last_access, step, expert);
+        const uint32_t frequency = access_count[expert];
+
+        // Router rank remains the primary eviction key. Recency and frequency
+        // only break equal-rank cases, which keeps this close to the previous
+        // rank-based policy while avoiding arbitrary token-order ties.
+        if (expert_rm_idx == -1 ||
+                rank_value > best_rank_value ||
+                (rank_value == best_rank_value && age > best_age) ||
+                (rank_value == best_rank_value && age == best_age && frequency < best_frequency)) {
+            expert_rm_idx = expert;
+            best_rank_value = rank_value;
+            best_age = age;
+            best_frequency = frequency;
+        }
+    }
+
+    return expert_rm_idx;
+}
+
+static void offload_expert_record_accesses(
+        int layer_id,
+        const std::vector<uint32_t> & routed_counts) {
+    auto & last_access  = om_519.expert_last_access[layer_id];
+    auto & access_count = om_519.expert_access_count[layer_id];
+
+    const uint64_t step = ++om_519.layer_steps[layer_id];
+
+    for (uint32_t expert = 0; expert < om_519.n_expert; ++expert) {
+        const uint32_t routed_count = routed_counts[expert];
+        if (routed_count == 0) {
+            continue;
+        }
+
+        last_access[expert] = step;
+
+        const uint64_t next_count = (uint64_t) access_count[expert] + routed_count;
+        access_count[expert] = next_count > std::numeric_limits<uint32_t>::max() ?
+            std::numeric_limits<uint32_t>::max() : (uint32_t) next_count;
+    }
 }
 
 
@@ -14767,7 +14849,23 @@ static bool hot_expert_offload_process(int layer_id, size_t n_tokens) {
         }
     }
 
+    std::vector<int32_t> eviction_rank(om_519.n_expert, -1);
+    for (size_t token = 0; token < n_tokens; ++token) {
+        const size_t token_offset = token * om_519.n_expert;
+        for (uint32_t rank = 0; rank < om_519.n_expert; ++rank) {
+            const int expert = om_519.argsort_buffer[token_offset + rank];
+            if (expert < 0 || expert >= (int) om_519.n_expert) {
+                GGML_LOG_ERROR("%s: invalid eviction rank expert %d for token %zu rank %u\n",
+                        __func__, expert, token, rank);
+                return false;
+            }
+
+            eviction_rank[expert] = std::max(eviction_rank[expert], (int32_t) rank);
+        }
+    }
+
     std::vector<bool> required(om_519.n_expert, false);
+    std::vector<uint32_t> routed_counts(om_519.n_expert, 0);
     std::vector<int> missing;
     size_t n_required = 0;
 
@@ -14779,6 +14877,7 @@ static bool hot_expert_offload_process(int layer_id, size_t n_tokens) {
                 GGML_LOG_ERROR("%s: invalid routed expert %d for token %zu\n", __func__, expert, token);
                 return false;
             }
+            routed_counts[expert]++;
             if (!required[expert]) {
                 required[expert] = true;
                 ++n_required;
@@ -14796,20 +14895,7 @@ static bool hot_expert_offload_process(int layer_id, size_t n_tokens) {
     }
 
     for (const int cur_expert_id : missing) {
-        int expert_rm_idx = -1;
-        for (int rank = om_519.n_expert - 1; rank >= (int) om_519.n_expert_used && expert_rm_idx == -1; --rank) {
-            for (size_t token = 0; token < n_tokens; ++token) {
-                const int candidate = om_519.argsort_buffer[token * om_519.n_expert + rank];
-                if (candidate < 0 || candidate >= (int) om_519.n_expert) {
-                    GGML_LOG_ERROR("%s: invalid eviction candidate %d for token %zu\n", __func__, candidate, token);
-                    return false;
-                }
-                if (!required[candidate] && expert_map[candidate] != EXPERT_NOT_LOADED) {
-                    expert_rm_idx = candidate;
-                    break;
-                }
-            }
-        }
+        const int expert_rm_idx = offload_expert_select_victim(layer_id, required, eviction_rank);
         if (expert_rm_idx == -1) {
             GGML_LOG_ERROR("%s: no resident expert is available for eviction\n", __func__);
             return false;
@@ -14828,6 +14914,8 @@ static bool hot_expert_offload_process(int layer_id, size_t n_tokens) {
         expert_map[cur_expert_id] = slot;
         expert_map[expert_rm_idx] = EXPERT_NOT_LOADED;
     }
+
+    offload_expert_record_accesses(layer_id, routed_counts);
 
     return true;
 }
