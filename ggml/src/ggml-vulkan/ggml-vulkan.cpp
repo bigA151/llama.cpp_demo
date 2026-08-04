@@ -14587,6 +14587,39 @@ static bool offload_expert_tensor_init(ggml_context * ctx) {
     return true;
 }
 
+static bool offload_mapped_topk_resize(size_t n_tokens) {
+    if (n_tokens == 0 || n_tokens > std::numeric_limits<size_t>::max() / om_519.n_expert_used / sizeof(int32_t)) {
+        GGML_LOG_ERROR("%s: invalid routed token count %zu\n", __func__, n_tokens);
+        return false;
+    }
+
+    const size_t n_bytes = om_519.n_expert_used * n_tokens * sizeof(int32_t);
+    if (ggml_backend_buffer_get_size(om_519.mapped_topk_buffer) < n_bytes) {
+        ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(
+                ggml_backend_get_default_buffer_type(om_519.backend), n_bytes);
+        if (buffer == nullptr) {
+            GGML_LOG_ERROR("%s: failed to grow mapped top-k buffer to %zu bytes\n", __func__, n_bytes);
+            return false;
+        }
+
+        ggml_backend_buffer_free(om_519.mapped_topk_buffer);
+        om_519.mapped_topk_buffer = buffer;
+    }
+
+    ggml_tensor * tensor = om_519.mapped_topk_tensor;
+    tensor->ne[0] = om_519.n_expert_used;
+    tensor->ne[1] = n_tokens;
+    tensor->ne[2] = 1;
+    tensor->ne[3] = 1;
+    tensor->nb[0] = sizeof(int32_t);
+    tensor->nb[1] = tensor->nb[0] * tensor->ne[0];
+    tensor->nb[2] = tensor->nb[1] * tensor->ne[1];
+    tensor->nb[3] = tensor->nb[2];
+    tensor->buffer = om_519.mapped_topk_buffer;
+    tensor->data = ggml_backend_buffer_get_base(om_519.mapped_topk_buffer);
+    return true;
+}
+
 static bool offload_expert_load_to_slot(
         int layer,
         int expert,
@@ -14668,79 +14701,98 @@ static bool offload_expert_buffer_manager_init(ggml_backend_t backend) {
 }
 
 
-// judge if a routed expert is in VRAM; load and map it if necessary
-static bool hot_expert_offload_process(int layer_id) {
+// judge if the routed experts are in VRAM; load and map them if necessary
+static bool hot_expert_offload_process(int layer_id, size_t n_tokens) {
     if (layer_id < 0 || layer_id >= (int) om_519.n_layer) {
         GGML_LOG_ERROR("%s: invalid layer %d\n", __func__, layer_id);
         return false;
     }
 
+    if (om_519.argsort_buffer.size() != n_tokens * om_519.n_expert) {
+        GGML_LOG_ERROR("%s: invalid argsort buffer size %zu for %zu routed tokens\n",
+                __func__, om_519.argsort_buffer.size(), n_tokens);
+        return false;
+    }
+
     auto & expert_map = om_519.expert_map[layer_id];
+    std::vector<int32_t> selected_topk(n_tokens * om_519.n_expert_used);
+    std::vector<bool> required(om_519.n_expert, false);
+    std::vector<int> missing;
+    size_t n_required = 0;
 
-    GGML_LOG_DEBUG("%s: layer=%d n_expert=%u n_expert_used=%u n_hot_expert=%u\n",
-        __func__, layer_id, om_519.n_expert, om_519.n_expert_used, om_519.n_hot_expert);
-    // Consider the next top-k experts after the selected set.  For
-    // Qwen3.5MoE this is ranks 9 through 16.
-    std::vector<int32_t> selected_experts(om_519.n_expert_used);
-    std::vector<int32_t> cold_positions;
-    std::vector<int32_t> replacement_experts;
+    for (size_t token = 0; token < n_tokens; ++token) {
+        const size_t token_offset = token * om_519.n_expert;
+        const size_t topk_offset = token * om_519.n_expert_used;
+        std::vector<int32_t> cold_positions;
+        std::vector<int32_t> replacement_experts;
 
-    for (uint32_t i = 0; i < om_519.n_expert_used; ++i) {
-        const int expert_id = om_519.argsort_buffer[i];
-        if (expert_id < 0 || expert_id >= (int) om_519.n_expert) {
-            GGML_LOG_ERROR("%s: invalid routed expert %d\n", __func__, expert_id);
-            return false;
+        for (uint32_t topk = 0; topk < om_519.n_expert_used; ++topk) {
+            const int expert = om_519.argsort_buffer[token_offset + topk];
+            if (expert < 0 || expert >= (int) om_519.n_expert) {
+                GGML_LOG_ERROR("%s: invalid routed expert %d for token %zu\n", __func__, expert, token);
+                return false;
+            }
+            selected_topk[topk_offset + topk] = expert;
         }
-        selected_experts[i] = expert_id;
+
+        for (int topk = (int) om_519.n_expert_used - 1; topk >= 0; --topk) {
+            if (expert_map[selected_topk[topk_offset + topk]] == EXPERT_NOT_LOADED) {
+                cold_positions.push_back(topk);
+            }
+        }
+
+        const uint32_t candidate_end = std::min(om_519.n_expert, om_519.n_expert_used * 2);
+        for (uint32_t rank = om_519.n_expert_used; rank < candidate_end; ++rank) {
+            const int expert = om_519.argsort_buffer[token_offset + rank];
+            if (expert < 0 || expert >= (int) om_519.n_expert) {
+                GGML_LOG_ERROR("%s: invalid candidate expert %d for token %zu\n", __func__, expert, token);
+                return false;
+            }
+            if (expert_map[expert] != EXPERT_NOT_LOADED) {
+                replacement_experts.push_back(expert);
+            }
+        }
+
+        const size_t replacement_count = std::min(cold_positions.size(), replacement_experts.size());
+        for (size_t i = 0; i < replacement_count; ++i) {
+            const int topk = cold_positions[i];
+            const int expert = replacement_experts[i];
+            selected_topk[topk_offset + topk] = expert;
+            GGML_LOG_INFO("%s: layer=%d token=%zu expert replacement: rank %d <- expert %d\n",
+                    __func__, layer_id, token, topk, expert);
+        }
+
+        for (uint32_t topk = 0; topk < om_519.n_expert_used; ++topk) {
+            const int expert = selected_topk[topk_offset + topk];
+            if (!required[expert]) {
+                required[expert] = true;
+                ++n_required;
+                if (expert_map[expert] == EXPERT_NOT_LOADED) {
+                    missing.push_back(expert);
+                }
+            }
+        }
     }
 
-    // Record cold top-k positions from lowest to highest route score.
-    for (int i = (int) om_519.n_expert_used - 1; i >= 0; --i) {
-        if (expert_map[selected_experts[i]] == EXPERT_NOT_LOADED) {
-            cold_positions.push_back(i);
-        }
+    if (n_required > om_519.n_hot_expert) {
+        GGML_LOG_ERROR("%s: microbatch requires %zu unique experts, but the layer cache holds only %u\n",
+                __func__, n_required, om_519.n_hot_expert);
+        return false;
     }
 
-    const uint32_t candidate_end = std::min(om_519.n_expert, om_519.n_expert_used * 2);
-    for (uint32_t i = om_519.n_expert_used; i < candidate_end; ++i) {
-        const int expert_id = om_519.argsort_buffer[i];
-        if (expert_id < 0 || expert_id >= (int) om_519.n_expert) {
-            GGML_LOG_ERROR("%s: invalid candidate expert %d\n", __func__, expert_id);
-            return false;
-        }
-        if (expert_map[expert_id] != EXPERT_NOT_LOADED) {
-            replacement_experts.push_back(expert_id);
-        }
-    }
-
-    const size_t replacement_count = std::min(cold_positions.size(), replacement_experts.size());
-    for (size_t i = 0; i < replacement_count; ++i) {
-        selected_experts[cold_positions[i]] = replacement_experts[i];
-        GGML_LOG_INFO("%s: layer=%d expert replacement: rank %d <- expert %d\n",
-            __func__, layer_id, cold_positions[i], replacement_experts[i]);
-    }
-
-    const auto is_selected_expert = [&](int expert_id) {
-        return std::find(selected_experts.begin(), selected_experts.end(), expert_id) != selected_experts.end();
-    };
-
-    for (uint32_t i = 0; i < om_519.n_expert_used; ++i) {
-        const int cur_expert_id = selected_experts[i];
-        if (cur_expert_id < 0 || cur_expert_id >= (int) om_519.n_expert) {
-            GGML_LOG_ERROR("%s: invalid routed expert %d\n", __func__, cur_expert_id);
-            return false;
-        }
-        if (expert_map[cur_expert_id] != EXPERT_NOT_LOADED) {
-            continue;
-        }
-
+    for (const int cur_expert_id : missing) {
         int expert_rm_idx = -1;
-        for (int rm_pos_idx = om_519.n_expert - 1; rm_pos_idx >= 0; --rm_pos_idx) {
-            const int candidate = om_519.argsort_buffer[rm_pos_idx];
-            if (candidate >= 0 && candidate < (int) om_519.n_expert && !is_selected_expert(candidate) &&
-                    expert_map[candidate] != EXPERT_NOT_LOADED) {
-                expert_rm_idx = candidate;
-                break;
+        for (int rank = om_519.n_expert - 1; rank >= (int) om_519.n_expert_used && expert_rm_idx == -1; --rank) {
+            for (size_t token = 0; token < n_tokens; ++token) {
+                const int candidate = om_519.argsort_buffer[token * om_519.n_expert + rank];
+                if (candidate < 0 || candidate >= (int) om_519.n_expert) {
+                    GGML_LOG_ERROR("%s: invalid eviction candidate %d for token %zu\n", __func__, candidate, token);
+                    return false;
+                }
+                if (!required[candidate] && expert_map[candidate] != EXPERT_NOT_LOADED) {
+                    expert_rm_idx = candidate;
+                    break;
+                }
             }
         }
         if (expert_rm_idx == -1) {
@@ -14762,8 +14814,7 @@ static bool hot_expert_offload_process(int layer_id) {
         expert_map[expert_rm_idx] = EXPERT_NOT_LOADED;
     }
 
-    std::copy(selected_experts.begin(), selected_experts.end(), om_519.argsort_buffer.begin());
-
+    om_519.topk_buffer = std::move(selected_topk);
     return true;
 }
 
@@ -15145,9 +15196,26 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 continue;
             }
 
-            if (argsort_size != om_519.argsort_buffer.size() * sizeof(int32_t)) {
+            if (argsort_candidate->type != GGML_TYPE_I32 || argsort_candidate->ne[0] != om_519.n_expert ||
+                    argsort_candidate->ne[1] <= 0 || argsort_candidate->ne[2] != 1 || argsort_candidate->ne[3] != 1) {
+                GGML_LOG_ERROR("%s: invalid SSD expert argsort tensor type=%s ne=[%lld, %lld, %lld, %lld]\n",
+                        __func__, ggml_type_name(argsort_candidate->type), static_cast<long long>(argsort_candidate->ne[0]),
+                        static_cast<long long>(argsort_candidate->ne[1]), static_cast<long long>(argsort_candidate->ne[2]),
+                        static_cast<long long>(argsort_candidate->ne[3]));
+                return GGML_STATUS_FAILED;
+            }
+
+            const size_t n_tokens = argsort_candidate->ne[1];
+            if (n_tokens > std::numeric_limits<size_t>::max() / om_519.n_expert / sizeof(int32_t)) {
+                GGML_LOG_ERROR("%s: routed token count %zu is too large\n", __func__, n_tokens);
+                return GGML_STATUS_FAILED;
+            }
+
+            const size_t argsort_elements = n_tokens * om_519.n_expert;
+            const size_t expected_argsort_size = argsort_elements * sizeof(int32_t);
+            if (argsort_size != expected_argsort_size) {
                 GGML_LOG_ERROR("%s: SSD expert argsort size mismatch: got %zu bytes, expected %zu bytes\n",
-                        __func__, argsort_size, om_519.argsort_buffer.size() * sizeof(int32_t));
+                        __func__, argsort_size, expected_argsort_size);
                 GGML_LOG_ERROR("%s: trigger_idx=%d trigger='%s', current_idx=%d, fused_ops=%d, candidate_idx=%d candidate='%s' op=%s type=%s ne=[%lld, %lld, %lld, %lld]\n",
                         __func__, ffn_weights_idx, ggml_get_name(cgraph->nodes[ffn_weights_idx]), i, additional_fused_ops,
                         argsort_idx, ggml_get_name(argsort_candidate), ggml_op_name(argsort_candidate->op),
@@ -15157,15 +15225,29 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 return GGML_STATUS_FAILED;
             }
 
+            om_519.argsort_buffer.resize(argsort_elements);
             ggml_backend_vk_get_tensor_async(backend, argsort_candidate, om_519.argsort_buffer.data(), 0, argsort_size);
             ggml_vk_synchronize(ctx);
 
-            if (!hot_expert_offload_process(layer_id)) {
+            if (!hot_expert_offload_process(layer_id, n_tokens)) {
                 return GGML_STATUS_FAILED;
             }
 
-            for (uint32_t topk = 0; topk < om_519.n_expert_used; ++topk) {
-                om_519.topk_buffer[topk] = om_519.expert_map[layer_id][om_519.argsort_buffer[topk]];
+            om_519.topk_buffer.resize(n_tokens * om_519.n_expert_used);
+            for (size_t token = 0; token < n_tokens; ++token) {
+                for (uint32_t topk = 0; topk < om_519.n_expert_used; ++topk) {
+                    const int expert = om_519.topk_buffer[token * om_519.n_expert_used + topk];
+                    const int slot = om_519.expert_map[layer_id][expert];
+                    if (slot == EXPERT_NOT_LOADED) {
+                        GGML_LOG_ERROR("%s: routed expert %d is not loaded after cache update\n", __func__, expert);
+                        return GGML_STATUS_FAILED;
+                    }
+                    om_519.topk_buffer[token * om_519.n_expert_used + topk] = slot;
+                }
+            }
+
+            if (!offload_mapped_topk_resize(n_tokens)) {
+                return GGML_STATUS_FAILED;
             }
             ggml_backend_vk_set_tensor_async(backend, om_519.mapped_topk_tensor, om_519.topk_buffer.data(), 0,
                     ggml_nbytes(om_519.mapped_topk_tensor));

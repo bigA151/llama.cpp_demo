@@ -254,6 +254,27 @@ llama_context::llama_context(
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
+#ifdef GGML_USE_VULKAN
+    bool has_vk_device = false;
+    for (const auto & device : model.devices) {
+        ggml_backend_reg_t reg = device.dev ? ggml_backend_dev_backend_reg(device.dev) : nullptr;
+        if (reg != nullptr && strcmp(ggml_backend_reg_name(reg), GGML_VK_NAME) == 0) {
+            has_vk_device = true;
+            break;
+        }
+    }
+
+    if (model.arch == LLM_ARCH_QWEN35MOE && has_vk_device && hparams.n_expert_used > 0 && !model.ssd_expert_addrs().empty() &&
+            params.n_ssd_expert_cache >= hparams.n_expert_used && params.n_ssd_expert_cache < hparams.n_expert) {
+        const uint32_t safe_ubatch = params.n_ssd_expert_cache / hparams.n_expert_used;
+        if (cparams.n_ubatch > safe_ubatch) {
+            LLAMA_LOG_INFO("%s: reducing n_ubatch from %u to %u for the SSD expert cache (%u cached, top-%u)\n",
+                    __func__, cparams.n_ubatch, safe_ubatch, params.n_ssd_expert_cache, hparams.n_expert_used);
+            cparams.n_ubatch = safe_ubatch;
+        }
+    }
+#endif
+
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
 
