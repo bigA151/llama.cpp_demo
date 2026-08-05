@@ -90,7 +90,8 @@ static bool llama_vk_ssd_expert_get_tensor_info(
 static void llama_vk_register_ssd_expert_provider(
         const llama_model & model,
         ggml_backend_t backend,
-        uint32_t n_hot_expert) {
+        uint32_t n_hot_expert,
+        bool enable_topk_substitution) {
     if (model.arch != LLM_ARCH_QWEN35MOE || !ggml_backend_is_vk(backend) || model.ssd_expert_addrs().empty()) {
         return;
     }
@@ -108,6 +109,7 @@ static void llama_vk_register_ssd_expert_provider(
         /* .n_expert         = */ model.hparams.n_expert,
         /* .n_expert_used    = */ model.hparams.n_expert_used,
         /* .n_hot_expert     = */ n_hot_expert,
+        /* .enable_topk_substitution = */ enable_topk_substitution,
     };
     ggml_backend_vk_set_ssd_expert_provider(backend, &provider);
 }
@@ -361,7 +363,8 @@ llama_context::llama_context(
 
 #ifdef GGML_USE_VULKAN
         for (auto & backend : backends) {
-            llama_vk_register_ssd_expert_provider(model, backend.get(), params.n_ssd_expert_cache);
+            llama_vk_register_ssd_expert_provider(model, backend.get(), params.n_ssd_expert_cache,
+                    params.ssd_expert_cache_substitute);
         }
 #endif
 
@@ -3017,6 +3020,7 @@ llama_context_params llama_context_default_params() {
         /*.n_batch                     =*/ 2048,
         /*.n_ubatch                    =*/ 512,
         /*.n_ssd_expert_cache          =*/ 180,
+        /*.ssd_expert_cache_substitute =*/ false,
         /*.n_seq_max                   =*/ 1,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,

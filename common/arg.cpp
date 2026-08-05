@@ -1276,6 +1276,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SSD_EXPERT_CACHE_EXPERTS"));
     add_opt(common_arg(
+        {"--ssd-expert-cache-substitute"},
+        "enable resident expert substitution for the Vulkan SSD expert cache (default: disabled)",
+        [](common_params & params) {
+            params.ssd_expert_cache_substitute = true;
+        }
+    ).set_env("LLAMA_ARG_SSD_EXPERT_CACHE_SUBSTITUTE"));
+    add_opt(common_arg(
         {"--keep"}, "N",
         string_format("number of tokens to keep from the initial prompt (default: %d, -1 = all)", params.n_keep),
         [](common_params & params, int value) {

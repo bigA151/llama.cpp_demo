@@ -14440,6 +14440,7 @@ typedef struct {
     uint32_t n_expert_used;
     uint32_t n_hot_expert;
     uint32_t n_layer;
+    bool enable_topk_substitution;
 
     std::vector<ggml_backend_buffer_t> offload_down_exps_buffer;
     std::vector<ggml_backend_buffer_t> offload_up_exps_buffer;
@@ -14460,6 +14461,8 @@ typedef struct {
 
     std::vector<int32_t> argsort_buffer;
     std::vector<int32_t> topk_buffer;
+    std::vector<float> gating_scores_buffer;
+    std::vector<float> topk_weights_buffer;
 
     struct ggml_tensor * mapped_topk_tensor;
     ggml_backend_buffer_t mapped_topk_buffer;
@@ -14679,6 +14682,7 @@ static bool offload_expert_buffer_manager_init(ggml_backend_t backend) {
     om_519.n_expert      = provider.n_expert;
     om_519.n_expert_used = provider.n_expert_used;
     om_519.n_hot_expert  = provider.n_hot_expert;
+    om_519.enable_topk_substitution = provider.enable_topk_substitution;
 
     const size_t n_layer = om_519.n_layer;
     om_519.offload_gate_exps_buffer.resize(n_layer);
@@ -14697,6 +14701,8 @@ static bool offload_expert_buffer_manager_init(ggml_backend_t backend) {
     om_519.layer_steps.assign(n_layer, 0);
     om_519.argsort_buffer.resize(provider.n_expert);
     om_519.topk_buffer.resize(provider.n_expert_used);
+    om_519.gating_scores_buffer.resize(provider.n_expert);
+    om_519.topk_weights_buffer.resize(provider.n_expert_used);
 
     offload_expert_ctx_init();
     if (om_519.offload_ctx == nullptr || !offload_expert_tensor_init(om_519.offload_ctx) || !offload_expert_and_map_init()) {
@@ -14784,15 +14790,31 @@ static void offload_expert_record_accesses(
 
 
 // judge if the routed experts are in VRAM; load and map them if necessary
-static bool hot_expert_offload_process(int layer_id, size_t n_tokens) {
+static bool hot_expert_offload_process(
+        int layer_id,
+        size_t n_tokens,
+        const float * gating_scores,
+        float * topk_weights,
+        bool * topk_weights_changed) {
     if (layer_id < 0 || layer_id >= (int) om_519.n_layer) {
         GGML_LOG_ERROR("%s: invalid layer %d\n", __func__, layer_id);
         return false;
     }
 
+    if (topk_weights_changed == nullptr) {
+        GGML_LOG_ERROR("%s: topk weight change flag is null\n", __func__);
+        return false;
+    }
+    *topk_weights_changed = false;
+
     if (om_519.argsort_buffer.size() != n_tokens * om_519.n_expert) {
         GGML_LOG_ERROR("%s: invalid argsort buffer size %zu for %zu routed tokens\n",
                 __func__, om_519.argsort_buffer.size(), n_tokens);
+        return false;
+    }
+
+    if (om_519.enable_topk_substitution && (gating_scores == nullptr || topk_weights == nullptr)) {
+        GGML_LOG_ERROR("%s: top-k substitution requires gating scores and mutable top-k weights\n", __func__);
         return false;
     }
 
@@ -14801,51 +14823,82 @@ static bool hot_expert_offload_process(int layer_id, size_t n_tokens) {
     GGML_LOG_DEBUG("%s: layer=%d n_expert=%u n_expert_used=%u n_hot_expert=%u\n",
         __func__, layer_id, om_519.n_expert, om_519.n_expert_used, om_519.n_hot_expert);
 
-    // Consider the next top-k experts after the selected set. For
-    // Qwen3.5MoE this is ranks 9 through 16.
-    const uint32_t candidate_end = std::min(om_519.n_expert, om_519.n_expert_used * 2);
-    for (size_t token = 0; token < n_tokens; ++token) {
-        const size_t token_offset = token * om_519.n_expert;
-        std::vector<int32_t> selected_experts(om_519.n_expert_used);
-        std::vector<int32_t> cold_positions;
-        std::vector<int32_t> replacement_experts;
+    if (om_519.enable_topk_substitution) {
+        // Consider the next top-k experts after the selected set. For
+        // Qwen3.5MoE this is ranks 9 through 16.
+        const uint32_t candidate_end = std::min(om_519.n_expert, om_519.n_expert_used * 2);
+        for (size_t token = 0; token < n_tokens; ++token) {
+            const size_t token_offset = token * om_519.n_expert;
+            const size_t weight_offset = token * om_519.n_expert_used;
+            std::vector<int32_t> selected_experts(om_519.n_expert_used);
+            std::vector<int32_t> cold_positions;
+            std::vector<int32_t> replacement_experts;
 
-        for (uint32_t topk = 0; topk < om_519.n_expert_used; ++topk) {
-            const int expert_id = om_519.argsort_buffer[token_offset + topk];
-            if (expert_id < 0 || expert_id >= (int) om_519.n_expert) {
-                //GGML_LOG_ERROR("%s: invalid routed expert %d for token %zu\n", __func__, expert_id, token);
+            for (uint32_t topk = 0; topk < om_519.n_expert_used; ++topk) {
+                const int expert_id = om_519.argsort_buffer[token_offset + topk];
+                if (expert_id < 0 || expert_id >= (int) om_519.n_expert) {
+                    GGML_LOG_ERROR("%s: invalid routed expert %d for token %zu\n", __func__, expert_id, token);
+                    return false;
+                }
+                selected_experts[topk] = expert_id;
+            }
+
+            // Record cold top-k positions from lowest to highest route score.
+            for (int topk = (int) om_519.n_expert_used - 1; topk >= 0; --topk) {
+                if (expert_map[selected_experts[topk]] == EXPERT_NOT_LOADED) {
+                    cold_positions.push_back(topk);
+                }
+            }
+
+            for (uint32_t rank = om_519.n_expert_used; rank < candidate_end; ++rank) {
+                const int expert_id = om_519.argsort_buffer[token_offset + rank];
+                if (expert_id < 0 || expert_id >= (int) om_519.n_expert) {
+                    GGML_LOG_ERROR("%s: invalid replacement candidate expert %d for token %zu\n", __func__, expert_id, token);
+                    return false;
+                }
+                if (expert_map[expert_id] != EXPERT_NOT_LOADED) {
+                    replacement_experts.push_back(expert_id);
+                }
+            }
+
+            const size_t replacement_count = std::min(cold_positions.size(), replacement_experts.size());
+            if (replacement_count == 0) {
+                continue;
+            }
+
+            for (size_t i = 0; i < replacement_count; ++i) {
+                selected_experts[cold_positions[i]] = replacement_experts[i];
+            }
+
+            float weight_sum = 0.0f;
+            for (uint32_t topk = 0; topk < om_519.n_expert_used; ++topk) {
+                const int expert_id = selected_experts[topk];
+                om_519.argsort_buffer[token_offset + topk] = expert_id;
+
+                const float weight = gating_scores[token_offset + expert_id];
+                if (!std::isfinite(weight) || weight < 0.0f) {
+                    GGML_LOG_ERROR("%s: invalid replacement gating weight %g for token %zu expert %d\n",
+                            __func__, (double) weight, token, expert_id);
+                    return false;
+                }
+
+                topk_weights[weight_offset + topk] = weight;
+                weight_sum += weight;
+            }
+
+            constexpr float min_weight_sum = 6.103515625e-5f;
+            if (!std::isfinite(weight_sum) || weight_sum <= 0.0f) {
+                GGML_LOG_ERROR("%s: invalid replacement gating weight sum %g for token %zu\n",
+                        __func__, (double) weight_sum, token);
                 return false;
             }
-            selected_experts[topk] = expert_id;
-        }
 
-        // Record cold top-k positions from lowest to highest route score.
-        for (int topk = (int) om_519.n_expert_used - 1; topk >= 0; --topk) {
-            if (expert_map[selected_experts[topk]] == EXPERT_NOT_LOADED) {
-                cold_positions.push_back(topk);
+            const float inv_weight_sum = 1.0f / std::max(weight_sum, min_weight_sum);
+            for (uint32_t topk = 0; topk < om_519.n_expert_used; ++topk) {
+                topk_weights[weight_offset + topk] *= inv_weight_sum;
             }
-        }
 
-        for (uint32_t rank = om_519.n_expert_used; rank < candidate_end; ++rank) {
-            const int expert_id = om_519.argsort_buffer[token_offset + rank];
-            if (expert_id < 0 || expert_id >= (int) om_519.n_expert) {
-                //GGML_LOG_ERROR("%s: invalid candidate expert %d for token %zu\n", __func__, expert_id, token);
-                return false;
-            }
-            if (expert_map[expert_id] != EXPERT_NOT_LOADED) {
-                replacement_experts.push_back(expert_id);
-            }
-        }
-
-        const size_t replacement_count = std::min(cold_positions.size(), replacement_experts.size());
-        for (size_t i = 0; i < replacement_count; ++i) {
-            selected_experts[cold_positions[i]] = replacement_experts[i];
-            //GGML_LOG_INFO("%s: layer=%d token=%zu expert replacement: rank %d <- expert %d\n",
-//                __func__, layer_id, token, cold_positions[i], replacement_experts[i]);
-        }
-
-        for (uint32_t topk = 0; topk < om_519.n_expert_used; ++topk) {
-            om_519.argsort_buffer[token_offset + topk] = selected_experts[topk];
+            *topk_weights_changed = true;
         }
     }
 
@@ -15327,12 +15380,79 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 return GGML_STATUS_FAILED;
             }
 
+            ggml_tensor * topk_weights_tensor = cgraph->nodes[ffn_weights_idx];
+            ggml_tensor * gating_scores_tensor = nullptr;
+            const bool use_topk_substitution = om_519.enable_topk_substitution;
+            size_t topk_weights_size = 0;
+
+            if (use_topk_substitution) {
+                if (topk_weights_tensor->op != GGML_OP_GET_ROWS || topk_weights_tensor->type != GGML_TYPE_F32 ||
+                        topk_weights_tensor->ne[0] != 1 || topk_weights_tensor->ne[1] != om_519.n_expert_used ||
+                        topk_weights_tensor->ne[2] != (int64_t) n_tokens || topk_weights_tensor->ne[3] != 1) {
+                    GGML_LOG_ERROR("%s: invalid SSD expert top-k weight tensor op=%s type=%s ne=[%lld, %lld, %lld, %lld]\n",
+                            __func__, ggml_op_name(topk_weights_tensor->op), ggml_type_name(topk_weights_tensor->type),
+                            static_cast<long long>(topk_weights_tensor->ne[0]), static_cast<long long>(topk_weights_tensor->ne[1]),
+                            static_cast<long long>(topk_weights_tensor->ne[2]), static_cast<long long>(topk_weights_tensor->ne[3]));
+                    return GGML_STATUS_FAILED;
+                }
+
+                gating_scores_tensor = topk_weights_tensor->src[0];
+                if (gating_scores_tensor == nullptr || gating_scores_tensor->type != GGML_TYPE_F32 ||
+                        gating_scores_tensor->ne[0] != 1 || gating_scores_tensor->ne[1] != om_519.n_expert ||
+                        gating_scores_tensor->ne[2] != (int64_t) n_tokens || gating_scores_tensor->ne[3] != 1) {
+                    GGML_LOG_ERROR("%s: invalid SSD expert gating score tensor type=%s ne=[%lld, %lld, %lld, %lld]\n",
+                            __func__, gating_scores_tensor ? ggml_type_name(gating_scores_tensor->type) : "(null)",
+                            gating_scores_tensor ? static_cast<long long>(gating_scores_tensor->ne[0]) : -1,
+                            gating_scores_tensor ? static_cast<long long>(gating_scores_tensor->ne[1]) : -1,
+                            gating_scores_tensor ? static_cast<long long>(gating_scores_tensor->ne[2]) : -1,
+                            gating_scores_tensor ? static_cast<long long>(gating_scores_tensor->ne[3]) : -1);
+                    return GGML_STATUS_FAILED;
+                }
+
+                if (n_tokens > std::numeric_limits<size_t>::max() / om_519.n_expert / sizeof(float) ||
+                        n_tokens > std::numeric_limits<size_t>::max() / om_519.n_expert_used / sizeof(float)) {
+                    GGML_LOG_ERROR("%s: routed token count %zu is too large for substitution weights\n", __func__, n_tokens);
+                    return GGML_STATUS_FAILED;
+                }
+
+                const size_t gating_score_elements = n_tokens * om_519.n_expert;
+                const size_t gating_scores_size = gating_score_elements * sizeof(float);
+                if (ggml_nbytes(gating_scores_tensor) != gating_scores_size) {
+                    GGML_LOG_ERROR("%s: SSD expert gating score size mismatch: got %zu bytes, expected %zu bytes\n",
+                            __func__, ggml_nbytes(gating_scores_tensor), gating_scores_size);
+                    return GGML_STATUS_FAILED;
+                }
+
+                const size_t topk_weight_elements = n_tokens * om_519.n_expert_used;
+                topk_weights_size = topk_weight_elements * sizeof(float);
+                if (ggml_nbytes(topk_weights_tensor) != topk_weights_size) {
+                    GGML_LOG_ERROR("%s: SSD expert top-k weight size mismatch: got %zu bytes, expected %zu bytes\n",
+                            __func__, ggml_nbytes(topk_weights_tensor), topk_weights_size);
+                    return GGML_STATUS_FAILED;
+                }
+
+                om_519.gating_scores_buffer.resize(gating_score_elements);
+                om_519.topk_weights_buffer.resize(topk_weight_elements);
+                ggml_backend_vk_get_tensor_async(backend, gating_scores_tensor, om_519.gating_scores_buffer.data(), 0, gating_scores_size);
+                ggml_backend_vk_get_tensor_async(backend, topk_weights_tensor, om_519.topk_weights_buffer.data(), 0, topk_weights_size);
+            }
+
             om_519.argsort_buffer.resize(argsort_elements);
             ggml_backend_vk_get_tensor_async(backend, argsort_candidate, om_519.argsort_buffer.data(), 0, argsort_size);
             ggml_vk_synchronize(ctx);
 
-            if (!hot_expert_offload_process(layer_id, n_tokens)) {
+            bool topk_weights_changed = false;
+            if (!hot_expert_offload_process(layer_id, n_tokens,
+                        use_topk_substitution ? om_519.gating_scores_buffer.data() : nullptr,
+                        use_topk_substitution ? om_519.topk_weights_buffer.data() : nullptr,
+                        &topk_weights_changed)) {
                 return GGML_STATUS_FAILED;
+            }
+
+            if (topk_weights_changed) {
+                ggml_backend_vk_set_tensor_async(backend, topk_weights_tensor, om_519.topk_weights_buffer.data(), 0,
+                        topk_weights_size);
+                ggml_vk_synchronize(ctx);
             }
 
             om_519.topk_buffer.resize(n_tokens * om_519.n_expert_used);

@@ -49,6 +49,7 @@ struct ggml_vk_ssd_expert_provider {
     uint32_t n_expert;
     uint32_t n_expert_used;
     uint32_t n_hot_expert;
+    bool enable_topk_substitution;
 };
 
 GGML_BACKEND_API void ggml_backend_vk_set_ssd_expert_provider(

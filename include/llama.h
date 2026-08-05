@@ -333,6 +333,7 @@ extern "C" {
         uint32_t n_batch;           // logical maximum batch size that can be submitted to llama_decode
         uint32_t n_ubatch;          // physical maximum batch size
         uint32_t n_ssd_expert_cache; // routed experts cached per Qwen3.5MoE layer
+        bool     ssd_expert_cache_substitute; // enable resident expert substitution for Vulkan SSD expert cache
         uint32_t n_seq_max;         // max number of sequences (i.e. distinct states for recurrent models)
         int32_t  n_threads;         // number of threads to use for generation
         int32_t  n_threads_batch;   // number of threads to use for batch processing
