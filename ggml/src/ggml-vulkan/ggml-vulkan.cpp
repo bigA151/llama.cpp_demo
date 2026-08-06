@@ -14727,18 +14727,17 @@ static uint64_t offload_expert_access_age(
 
 static int offload_expert_select_victim(
         int layer_id,
-        const std::vector<bool> & required,
-        const std::vector<int32_t> & eviction_rank) {
+        const std::vector<bool> & required) {
     auto & expert_map   = om_519.expert_map[layer_id];
     auto & last_access  = om_519.expert_last_access[layer_id];
-    //auto & access_count = om_519.expert_access_count[layer_id];
+    auto & access_count = om_519.expert_access_count[layer_id];
 
     const uint64_t step = om_519.layer_steps[layer_id];
 
     int expert_rm_idx = -1;
     //int32_t best_rank_value = -1;
     uint64_t best_age = 0;
-    //uint32_t best_frequency = std::numeric_limits<uint32_t>::max();
+    uint32_t best_frequency = std::numeric_limits<uint32_t>::max();
 
     for (uint32_t expert = 0; expert < om_519.n_expert; ++expert) {
         if (required[expert] || expert_map[expert] == EXPERT_NOT_LOADED) {
@@ -14747,16 +14746,19 @@ static int offload_expert_select_victim(
 
         //const int32_t rank_value = eviction_rank[expert];
         const uint64_t age = offload_expert_access_age(last_access, step, expert);
-        //const uint32_t frequency = access_count[expert];
+        const uint32_t frequency = access_count[expert];
 
         // Router rank remains the primary eviction key. Recency and frequency
         // only break equal-rank cases, which keeps this close to the previous
         // rank-based policy while avoiding arbitrary token-order ties.
-        if (expert_rm_idx == -1 || age > best_age) {
+        if (expert_rm_idx == -1 || age > best_age
+            || (age == best_age && frequency < best_frequency)
+                //|| (age == best_age && frequency == best_frequency && rank_value > best_rank_value)
+                ) {
             expert_rm_idx = expert;
             //best_rank_value = rank_value;
             best_age = age;
-            //best_frequency = frequency;
+            best_frequency = frequency;
         }
     }
 
@@ -14899,20 +14901,20 @@ static bool hot_expert_offload_process(
         }
     }
 
-    std::vector<int32_t> eviction_rank(om_519.n_expert, -1);
-    for (size_t token = 0; token < n_tokens; ++token) {
-        const size_t token_offset = token * om_519.n_expert;
-        for (uint32_t rank = 0; rank < om_519.n_expert; ++rank) {
-            const int expert = om_519.argsort_buffer[token_offset + rank];
-            if (expert < 0 || expert >= (int) om_519.n_expert) {
-                GGML_LOG_ERROR("%s: invalid eviction rank expert %d for token %zu rank %u\n",
-                        __func__, expert, token, rank);
-                return false;
-            }
+    // std::vector<int32_t> eviction_rank(om_519.n_expert, -1);
+    // for (size_t token = 0; token < n_tokens; ++token) {
+    //     const size_t token_offset = token * om_519.n_expert;
+    //     for (uint32_t rank = 0; rank < om_519.n_expert; ++rank) {
+    //         const int expert = om_519.argsort_buffer[token_offset + rank];
+    //         if (expert < 0 || expert >= (int) om_519.n_expert) {
+    //             GGML_LOG_ERROR("%s: invalid eviction rank expert %d for token %zu rank %u\n",
+    //                     __func__, expert, token, rank);
+    //             return false;
+    //         }
 
-            eviction_rank[expert] = std::max(eviction_rank[expert], (int32_t) rank);
-        }
-    }
+    //         eviction_rank[expert] = std::max(eviction_rank[expert], (int32_t) rank);
+    //     }
+    // }
 
     std::vector<bool> required(om_519.n_expert, false);
     std::vector<uint32_t> routed_counts(om_519.n_expert, 0);
@@ -14945,7 +14947,7 @@ static bool hot_expert_offload_process(
     }
 
     for (const int cur_expert_id : missing) {
-        const int expert_rm_idx = offload_expert_select_victim(layer_id, required, eviction_rank);
+        const int expert_rm_idx = offload_expert_select_victim(layer_id, required);
         if (expert_rm_idx == -1) {
             GGML_LOG_ERROR("%s: no resident expert is available for eviction\n", __func__);
             return false;
