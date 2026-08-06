@@ -14731,35 +14731,32 @@ static int offload_expert_select_victim(
         const std::vector<int32_t> & eviction_rank) {
     auto & expert_map   = om_519.expert_map[layer_id];
     auto & last_access  = om_519.expert_last_access[layer_id];
-    auto & access_count = om_519.expert_access_count[layer_id];
+    //auto & access_count = om_519.expert_access_count[layer_id];
 
     const uint64_t step = om_519.layer_steps[layer_id];
 
     int expert_rm_idx = -1;
-    int32_t best_rank_value = -1;
+    //int32_t best_rank_value = -1;
     uint64_t best_age = 0;
-    uint32_t best_frequency = std::numeric_limits<uint32_t>::max();
+    //uint32_t best_frequency = std::numeric_limits<uint32_t>::max();
 
     for (uint32_t expert = 0; expert < om_519.n_expert; ++expert) {
         if (required[expert] || expert_map[expert] == EXPERT_NOT_LOADED) {
             continue;
         }
 
-        const int32_t rank_value = eviction_rank[expert];
+        //const int32_t rank_value = eviction_rank[expert];
         const uint64_t age = offload_expert_access_age(last_access, step, expert);
-        const uint32_t frequency = access_count[expert];
+        //const uint32_t frequency = access_count[expert];
 
         // Router rank remains the primary eviction key. Recency and frequency
         // only break equal-rank cases, which keeps this close to the previous
         // rank-based policy while avoiding arbitrary token-order ties.
-        if (expert_rm_idx == -1 ||
-                rank_value > best_rank_value ||
-                (rank_value == best_rank_value && age > best_age) ||
-                (rank_value == best_rank_value && age == best_age && frequency < best_frequency)) {
+        if (expert_rm_idx == -1 || age > best_age) {
             expert_rm_idx = expert;
-            best_rank_value = rank_value;
+            //best_rank_value = rank_value;
             best_age = age;
-            best_frequency = frequency;
+            //best_frequency = frequency;
         }
     }
 
