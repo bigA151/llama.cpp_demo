@@ -17,6 +17,7 @@
 
 #include <cinttypes>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -219,8 +220,9 @@ static bool llama_vk_register_ssd_expert_provider(
     ggml_backend_vk_set_ssd_expert_provider(backend, &provider);
     return true;
 }
+#endif
 
-static bool llama_ssd_expert_argsort_layer(const ggml_tensor * tensor, int & layer) {
+static bool llama_moe_argsort_layer(const ggml_tensor * tensor, int & layer) {
     static constexpr char prefix[] = "ffn_moe_argsort-";
 
     if (tensor == nullptr || tensor->op != GGML_OP_ARGSORT) {
@@ -241,7 +243,6 @@ static bool llama_ssd_expert_argsort_layer(const ggml_tensor * tensor, int & lay
     layer = (int) parsed;
     return true;
 }
-#endif
 
 bool llama_context::eval_callback_trampoline(ggml_tensor * tensor, bool ask, void * user_data) {
     llama_context * ctx = static_cast<llama_context *>(user_data);
@@ -259,8 +260,10 @@ bool llama_context::eval_callback(ggml_tensor * tensor, bool ask) {
 
     bool cache_requested = false;
     int layer = -1;
+    const bool stats_requested = moe_argsort_stats_enabled && llama_moe_argsort_layer(tensor, layer) &&
+            ggml_nbytes(tensor) > 0;
 #ifdef GGML_USE_VULKAN
-    cache_requested = ssd_expert_cache_enabled && llama_ssd_expert_argsort_layer(tensor, layer) &&
+    cache_requested = ssd_expert_cache_enabled && llama_moe_argsort_layer(tensor, layer) &&
             ggml_nbytes(tensor) > 0;
     ggml_backend_t cache_backend = cache_requested ?
             ggml_backend_sched_get_tensor_backend(sched.get(), tensor) : nullptr;
@@ -268,7 +271,7 @@ bool llama_context::eval_callback(ggml_tensor * tensor, bool ask) {
 #endif
 
     if (ask) {
-        return user_requested || cache_requested;
+        return user_requested || cache_requested || stats_requested;
     }
 
     bool keep_going = true;
@@ -314,11 +317,93 @@ bool llama_context::eval_callback(ggml_tensor * tensor, bool ask) {
     }
 #endif
 
+    if (stats_requested) {
+        moe_argsort_stats_collect(tensor, layer);
+    }
+
     if (eval_callback_user_requested.erase(tensor) > 0 && cparams.cb_eval != nullptr) {
         keep_going = cparams.cb_eval(tensor, false, cparams.cb_eval_user_data) && keep_going;
     }
 
     return keep_going;
+}
+
+void llama_context::moe_argsort_stats_collect(const ggml_tensor * tensor, int layer) {
+    constexpr size_t top_k = 8;
+
+    if (tensor->type != GGML_TYPE_I32 || tensor->ne[0] <= 0 || tensor->ne[1] <= 0 ||
+            tensor->ne[2] != 1 || tensor->ne[3] != 1) {
+        LLAMA_LOG_ERROR("%s: invalid MoE argsort tensor '%s' type=%s ne=[%lld, %lld, %lld, %lld]\n",
+                __func__, ggml_get_name(tensor), ggml_type_name(tensor->type),
+                static_cast<long long>(tensor->ne[0]), static_cast<long long>(tensor->ne[1]),
+                static_cast<long long>(tensor->ne[2]), static_cast<long long>(tensor->ne[3]));
+        return;
+    }
+
+    const size_t n_expert = tensor->ne[0];
+    const size_t n_tokens = tensor->ne[1];
+    if (n_tokens > std::numeric_limits<size_t>::max() / n_expert ||
+            n_tokens * n_expert > std::numeric_limits<size_t>::max() / sizeof(int32_t)) {
+        LLAMA_LOG_ERROR("%s: MoE argsort tensor '%s' is too large\n", __func__, ggml_get_name(tensor));
+        return;
+    }
+
+    std::vector<int32_t> argsort(n_tokens * n_expert);
+    ggml_backend_tensor_get(tensor, argsort.data(), 0, argsort.size() * sizeof(int32_t));
+
+    const size_t n_top = std::min(top_k, n_expert);
+    moe_argsort_top_k = n_top;
+    std::vector<int32_t> topk(n_tokens * n_top);
+    for (size_t token = 0; token < n_tokens; ++token) {
+        fprintf(stderr, "moe_argsort: layer=%d token=%zu top-%zu experts:", layer, token, n_top);
+        for (size_t rank = 0; rank < n_top; ++rank) {
+            const int32_t expert = argsort[token*n_expert + rank];
+            topk[token*n_top + rank] = expert;
+            fprintf(stderr, " %d", expert);
+        }
+        fprintf(stderr, "\n");
+    }
+
+    if (!moe_argsort_previous_topk.empty() && moe_argsort_previous_n_tokens == n_tokens) {
+        for (size_t token = 0; token < n_tokens; ++token) {
+            for (size_t rank = 0; rank < n_top; ++rank) {
+                uint64_t n_overlap = 0;
+                for (size_t current = 0; current <= rank; ++current) {
+                    for (size_t previous = 0; previous <= rank; ++previous) {
+                        n_overlap += topk[token*n_top + current] ==
+                                moe_argsort_previous_topk[token*n_top + previous];
+                    }
+                }
+                moe_argsort_overlap_sum[rank] += n_overlap;
+            }
+        }
+        moe_argsort_overlap_count += n_tokens;
+    }
+
+    moe_argsort_previous_topk.swap(topk);
+    moe_argsort_previous_n_tokens = n_tokens;
+}
+
+void llama_context::moe_argsort_stats_reset() {
+    moe_argsort_previous_topk.clear();
+    moe_argsort_overlap_sum.fill(0);
+    moe_argsort_overlap_count = 0;
+    moe_argsort_previous_n_tokens = 0;
+    moe_argsort_top_k = 0;
+}
+
+void llama_context::moe_argsort_stats_print() const {
+    if (moe_argsort_overlap_count == 0) {
+        return;
+    }
+
+    fprintf(stderr, "moe_argsort: adjacent MoE layer overlap rate:");
+    for (size_t rank = 0; rank < moe_argsort_top_k; ++rank) {
+        const double rate = 100.0 * moe_argsort_overlap_sum[rank] /
+                (moe_argsort_overlap_count * (rank + 1));
+        fprintf(stderr, " top-%zu=%.2f%%", rank + 1, rate);
+    }
+    fprintf(stderr, "\n");
 }
 
 llama_context::llama_context(
@@ -495,6 +580,15 @@ llama_context::llama_context(
 
         if (graph_reuse_disable) {
             LLAMA_LOG_WARN("%s: graph reuse disabled\n", __func__);
+        }
+    }
+
+    {
+        const char * LLAMA_MOE_ARGSORT_STATS = getenv("LLAMA_MOE_ARGSORT_STATS");
+        moe_argsort_stats_enabled = LLAMA_MOE_ARGSORT_STATS && atoi(LLAMA_MOE_ARGSORT_STATS) != 0;
+
+        if (moe_argsort_stats_enabled) {
+            fprintf(stderr, "%s: MoE argsort top-8 logging enabled\n", __func__);
         }
     }
 
@@ -1540,7 +1634,8 @@ llm_graph_result * llama_context::process_ubatch(
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(
                 sched.get(),
-                (ssd_expert_cache_enabled || cparams.cb_eval != nullptr) ? eval_callback_trampoline : nullptr,
+                (ssd_expert_cache_enabled || moe_argsort_stats_enabled || cparams.cb_eval != nullptr) ?
+                    eval_callback_trampoline : nullptr,
                 this);
 
         //const auto t_start_us = ggml_time_us();
@@ -2568,9 +2663,16 @@ ggml_status llama_context::graph_compute(
     eval_graph = gf;
     ssd_expert_cache_failed = false;
     eval_callback_user_requested.clear();
+    if (moe_argsort_stats_enabled) {
+        moe_argsort_stats_reset();
+    }
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     eval_graph = nullptr;
+
+    if (moe_argsort_stats_enabled) {
+        moe_argsort_stats_print();
+    }
 
     if (status == GGML_STATUS_SUCCESS && ssd_expert_cache_failed) {
         status = GGML_STATUS_FAILED;

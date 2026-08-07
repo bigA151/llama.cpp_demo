@@ -10,6 +10,7 @@
 #include "ggml-opt.h"
 
 #include <map>
+#include <array>
 #include <set>
 #include <vector>
 
@@ -247,6 +248,9 @@ private:
 
     static bool eval_callback_trampoline(ggml_tensor * tensor, bool ask, void * user_data);
     bool eval_callback(ggml_tensor * tensor, bool ask);
+    void moe_argsort_stats_collect(const ggml_tensor * tensor, int layer);
+    void moe_argsort_stats_reset();
+    void moe_argsort_stats_print() const;
 
     // TODO: read/write lora adapters and cvec
     size_t state_write_data(llama_io_write_i & io);
@@ -319,6 +323,12 @@ private:
     ggml_cgraph * eval_graph = nullptr;
     std::set<ggml_tensor *> eval_callback_user_requested;
     std::vector<int32_t> ssd_expert_argsort;
+    std::vector<int32_t> moe_argsort_previous_topk;
+    std::array<uint64_t, 8> moe_argsort_overlap_sum = {};
+    uint64_t moe_argsort_overlap_count = 0;
+    size_t moe_argsort_previous_n_tokens = 0;
+    size_t moe_argsort_top_k = 0;
+    bool moe_argsort_stats_enabled = false;
     bool ssd_expert_cache_enabled = false;
     bool ssd_expert_cache_failed  = false;
     bool ssd_timing_prefill_done  = false;
