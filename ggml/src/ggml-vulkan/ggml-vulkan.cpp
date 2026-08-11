@@ -14845,7 +14845,12 @@ static bool offload_expert_buffer_manager_init(ggml_backend_t backend) {
 
 
 // judge if the routed experts are in VRAM; load and map them if necessary
-static bool hot_expert_offload_process(int layer_id, size_t n_tokens) {
+static bool hot_expert_offload_process(
+        int      layer_id,
+        uint32_t wave,
+        uint32_t wave_capacity,
+        bool     allow_resident_topk_fallback,
+        size_t   n_tokens) {
     const bool ssd_timing = ssd_expert_timing_capture_active();
     if (ssd_timing) {
         ssd_expert_timing = {};
@@ -14875,6 +14880,9 @@ static bool hot_expert_offload_process(int layer_id, size_t n_tokens) {
     ggml_vk_ssd_expert_cache_plan plan = {
         /* .layer                = */ layer_id,
         /* .n_hot_expert         = */ om_519.n_hot_expert,
+        /* .wave                 = */ wave,
+        /* .wave_capacity        = */ wave_capacity,
+        /* .allow_resident_topk_fallback = */ allow_resident_topk_fallback,
         /* .argsort              = */ om_519.argsort_buffer.data(),
         /* .n_tokens             = */ n_tokens,
         /* .expert_map           = */ expert_map.data(),
@@ -15012,6 +15020,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     uint64_t mul_mat_bytes = 0;
     uint64_t total_mul_mat_bytes = 0;
     uint64_t mul_mat_bytes_per_submit = std::min(uint64_t(100*1000*1000), ctx->last_total_mul_mat_bytes / 40u);
+    bool direct_ssd_graph = false;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         // GOOFY_VK_LOG_DEBUG("graph_compute(" << ggml_op_name(cgraph->nodes[i]->op) << ", " << ggml_get_name(cgraph->nodes[i]) << ")");
         if (first_node_in_batch) {
@@ -15216,10 +15225,43 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         // Signal the almost_ready fence when the graph is mostly complete (< 20% remaining)
         bool almost_ready = (cgraph->n_nodes - i) < cgraph->n_nodes / 5;
 
+        int direct_ssd_layer = -1;
+        int direct_ssd_argsort_idx = -1;
+        if (om_519.is_inited) {
+            int parsed = 0;
+            const char * node_name = ggml_get_name(cgraph->nodes[i]);
+            if (sscanf(node_name, "ffn_moe_weights-%d%n", &direct_ssd_layer, &parsed) != 1 ||
+                    parsed <= 0 || node_name[parsed] != '\0' || direct_ssd_layer < 0 ||
+                    direct_ssd_layer >= (int) om_519.n_layer) {
+                direct_ssd_layer = -1;
+            } else {
+                char argsort_name[GGML_MAX_NAME];
+                char gate_name[GGML_MAX_NAME];
+                char up_name[GGML_MAX_NAME];
+                char down_name[GGML_MAX_NAME];
+                snprintf(argsort_name, sizeof(argsort_name), "ffn_moe_argsort-%d", direct_ssd_layer);
+                snprintf(gate_name, sizeof(gate_name), "ffn_moe_gate-%d", direct_ssd_layer);
+                snprintf(up_name, sizeof(up_name), "ffn_moe_up-%d", direct_ssd_layer);
+                snprintf(down_name, sizeof(down_name), "ffn_moe_down-%d", direct_ssd_layer);
+
+                direct_ssd_argsort_idx = find_named_node_index(cgraph, argsort_name, GGML_OP_ARGSORT);
+                if (direct_ssd_argsort_idx < 0 ||
+                        find_named_node_index(cgraph, gate_name, GGML_OP_MUL_MAT_ID) < 0 ||
+                        find_named_node_index(cgraph, up_name, GGML_OP_MUL_MAT_ID) < 0 ||
+                        find_named_node_index(cgraph, down_name, GGML_OP_MUL_MAT_ID) < 0) {
+                    // Wave graphs intentionally have suffixed expert node names and are
+                    // handled by the scheduler callback instead.
+                    direct_ssd_layer = -1;
+                    direct_ssd_argsort_idx = -1;
+                }
+            }
+        }
+
         bool submit = (submitted_nodes >= nodes_per_submit) ||
                       (mul_mat_bytes_per_submit != 0 && mul_mat_bytes >= mul_mat_bytes_per_submit) ||
                       (i + ctx->num_additional_fused_ops >= last_node) ||
-                      (almost_ready && !ctx->almost_ready_fence_pending);
+                      (almost_ready && !ctx->almost_ready_fence_pending) ||
+                      direct_ssd_layer >= 0;
 
         bool enqueued = ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx], submit_node_idx, i + ctx->num_additional_fused_ops >= last_node, almost_ready, submit);
 
@@ -15259,6 +15301,47 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         i += ctx->num_additional_fused_ops;
         ctx->num_additional_fused_ops = 0;
         ctx->fused_ops_write_mask = 0;
+
+        if (direct_ssd_layer >= 0) {
+            direct_ssd_graph = true;
+            ggml_tensor * argsort = cgraph->nodes[direct_ssd_argsort_idx];
+            const size_t argsort_size = ggml_nbytes(argsort);
+
+            // The last transformer layer can have no output tokens after output pruning.
+            if (argsort_size == 0) {
+                continue;
+            }
+            if (argsort->type != GGML_TYPE_I32 || argsort->ne[0] != om_519.n_expert ||
+                    argsort->ne[1] <= 0 || argsort->ne[2] != 1 || argsort->ne[3] != 1) {
+                GGML_LOG_ERROR("%s: invalid SSD expert argsort tensor '%s' type=%s ne=[%lld, %lld, %lld, %lld]\n",
+                        __func__, ggml_get_name(argsort), ggml_type_name(argsort->type),
+                        static_cast<long long>(argsort->ne[0]), static_cast<long long>(argsort->ne[1]),
+                        static_cast<long long>(argsort->ne[2]), static_cast<long long>(argsort->ne[3]));
+                return GGML_STATUS_FAILED;
+            }
+
+            const size_t n_tokens = argsort->ne[1];
+            if (n_tokens > std::numeric_limits<size_t>::max() / om_519.n_expert / sizeof(int32_t)) {
+                GGML_LOG_ERROR("%s: routed token count %zu is too large\n", __func__, n_tokens);
+                return GGML_STATUS_FAILED;
+            }
+            const size_t argsort_elements = n_tokens * om_519.n_expert;
+            if (argsort_size != argsort_elements * sizeof(int32_t)) {
+                GGML_LOG_ERROR("%s: SSD expert argsort size mismatch: got %zu bytes, expected %zu bytes\n",
+                        __func__, argsort_size, argsort_elements * sizeof(int32_t));
+                return GGML_STATUS_FAILED;
+            }
+
+            om_519.argsort_buffer.resize(argsort_elements);
+            ggml_backend_vk_get_tensor_async(backend, argsort, om_519.argsort_buffer.data(), 0, argsort_size);
+            ggml_vk_synchronize(ctx);
+
+            if (!ggml_backend_vk_apply_ssd_expert_cache(
+                        backend, cgraph, direct_ssd_layer,
+                        om_519.argsort_buffer.data(), n_tokens)) {
+                return GGML_STATUS_FAILED;
+            }
+        }
     }
 
     ctx->last_total_mul_mat_bytes = total_mul_mat_bytes;
@@ -15306,13 +15389,102 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->perf_logger->print_timings();
     }
 
-    if (!ctx->device->support_async) {
+    if (direct_ssd_graph) {
+        // The direct SSD path synchronizes repeatedly while replacing experts. Finish and
+        // release those graph-lifetime Vulkan contexts here; otherwise the intermediate-sync
+        // API keeps accumulating them across every single-token ubatch in one llama_decode().
+        ggml_vk_synchronize(ctx);
+        if (ctx->cleanup_pending) {
+            ggml_vk_graph_cleanup(ctx);
+        }
+    } else if (!ctx->device->support_async) {
         ggml_vk_synchronize(ctx);
     }
 
     return GGML_STATUS_SUCCESS;
 
     UNUSED(backend);
+}
+
+bool ggml_backend_vk_apply_ssd_expert_cache_wave(
+        ggml_backend_t backend,
+        struct ggml_cgraph * cgraph,
+        int layer_id,
+        uint32_t wave,
+        uint32_t wave_capacity,
+        const int32_t * argsort,
+        size_t n_tokens,
+        struct ggml_tensor * mapped_topk) {
+    if (!ggml_backend_is_vk(backend) || cgraph == nullptr || argsort == nullptr || !om_519.is_inited ||
+            mapped_topk == nullptr || backend != om_519.backend || layer_id < 0 ||
+            layer_id >= (int) om_519.n_layer || wave_capacity == 0 || n_tokens == 0) {
+        GGML_LOG_ERROR("%s: invalid SSD expert cache request\n", __func__);
+        return false;
+    }
+
+    ggml_backend_vk_context * ctx = (ggml_backend_vk_context *) backend->context;
+    const bool ssd_timing = ctx->ssd_timing.active;
+    if (ssd_timing && ctx->ssd_timing.has_pending_sync) {
+        ctx->ssd_timing.layer_sync.add(ctx->ssd_timing.pending_sync);
+        ctx->ssd_timing.has_pending_sync = false;
+    }
+    const int64_t total_start_us = ssd_timing ? ssd_expert_timing_now_us() : 0;
+
+    if (n_tokens > std::numeric_limits<size_t>::max() / om_519.n_expert) {
+        GGML_LOG_ERROR("%s: routed token count %zu is too large\n", __func__, n_tokens);
+        return false;
+    }
+    if (mapped_topk->type != GGML_TYPE_I32 || !ggml_is_contiguous(mapped_topk) ||
+            mapped_topk->ne[0] != om_519.n_expert_used || mapped_topk->ne[1] != (int64_t) n_tokens ||
+            mapped_topk->ne[2] != 1 || mapped_topk->ne[3] != 1 ||
+            ggml_nbytes(mapped_topk) != n_tokens * om_519.n_expert_used * sizeof(int32_t)) {
+        GGML_LOG_ERROR("%s: invalid mapped top-k tensor '%s'\n", __func__, ggml_get_name(mapped_topk));
+        return false;
+    }
+
+    char gate_name[GGML_MAX_NAME];
+    char up_name[GGML_MAX_NAME];
+    char down_name[GGML_MAX_NAME];
+    snprintf(gate_name, sizeof(gate_name), "ffn_moe_gate_wave_%u_%u-%d", wave, wave_capacity, layer_id);
+    snprintf(up_name, sizeof(up_name), "ffn_moe_up_wave_%u_%u-%d", wave, wave_capacity, layer_id);
+    snprintf(down_name, sizeof(down_name), "ffn_moe_down_wave_%u_%u-%d", wave, wave_capacity, layer_id);
+
+    const int gate_idx = find_named_node_index(cgraph, gate_name, GGML_OP_MUL_MAT_ID);
+    const int up_idx = find_named_node_index(cgraph, up_name, GGML_OP_MUL_MAT_ID);
+    const int down_idx = find_named_node_index(cgraph, down_name, GGML_OP_MUL_MAT_ID);
+    if (gate_idx < 0 || up_idx < 0 || down_idx < 0) {
+        GGML_LOG_ERROR("%s: incomplete SSD expert compute nodes for layer %d wave %u: gate=%d up=%d down=%d\n",
+                __func__, layer_id, wave, gate_idx, up_idx, down_idx);
+        return false;
+    }
+
+    const size_t argsort_elements = n_tokens * om_519.n_expert;
+    om_519.argsort_buffer.assign(argsort, argsort + argsort_elements);
+
+    if (!hot_expert_offload_process(layer_id, wave, wave_capacity, false, n_tokens)) {
+        return false;
+    }
+
+    const int64_t mapped_start_us = ssd_timing ? ssd_expert_timing_now_us() : 0;
+    ggml_backend_tensor_set(mapped_topk, om_519.topk_buffer.data(), 0, ggml_nbytes(mapped_topk));
+    const int64_t mapped_us = ssd_timing ? ssd_expert_timing_now_us() - mapped_start_us : 0;
+
+    cgraph->nodes[gate_idx]->src[0] = om_519.hot_gate_tensor[layer_id];
+    cgraph->nodes[up_idx]->src[0] = om_519.hot_up_tensor[layer_id];
+    cgraph->nodes[down_idx]->src[0] = om_519.hot_down_tensor[layer_id];
+
+    if (ssd_timing) {
+        const int64_t total_us = ssd_expert_timing_now_us() - total_start_us;
+        auto & cache = ctx->ssd_timing.cache;
+        ++cache.layers;
+        cache.loads += ssd_expert_timing.n_loads;
+        cache.plan_us += ssd_expert_timing.plan_us;
+        cache.expert_load_us += ssd_expert_timing.expert_load_us;
+        cache.mapped_upload_us += mapped_us;
+        cache.total_us += total_us;
+    }
+
+    return true;
 }
 
 bool ggml_backend_vk_apply_ssd_expert_cache(
@@ -15357,15 +15529,25 @@ bool ggml_backend_vk_apply_ssd_expert_cache(
     }
 
     const size_t argsort_elements = n_tokens * om_519.n_expert;
-    om_519.argsort_buffer.assign(argsort, argsort + argsort_elements);
+    if (argsort != om_519.argsort_buffer.data()) {
+        om_519.argsort_buffer.assign(argsort, argsort + argsort_elements);
+    } else if (om_519.argsort_buffer.size() != argsort_elements) {
+        GGML_LOG_ERROR("%s: invalid internal argsort buffer size %zu, expected %zu\n",
+                __func__, om_519.argsort_buffer.size(), argsort_elements);
+        return false;
+    }
 
-    if (!hot_expert_offload_process(layer_id, n_tokens) || !offload_mapped_topk_resize(n_tokens)) {
+    if (!hot_expert_offload_process(layer_id, 0, om_519.n_hot_expert, true, n_tokens)) {
+        return false;
+    }
+
+    if (!offload_mapped_topk_resize(n_tokens)) {
         return false;
     }
 
     const int64_t mapped_start_us = ssd_timing ? ssd_expert_timing_now_us() : 0;
-    ggml_backend_vk_set_tensor_async(backend, om_519.mapped_topk_tensor, om_519.topk_buffer.data(), 0,
-            ggml_nbytes(om_519.mapped_topk_tensor));
+    ggml_backend_vk_set_tensor_async(backend, om_519.mapped_topk_tensor,
+            om_519.topk_buffer.data(), 0, ggml_nbytes(om_519.mapped_topk_tensor));
     ggml_vk_synchronize(ctx);
     const int64_t mapped_us = ssd_timing ? ssd_expert_timing_now_us() - mapped_start_us : 0;
 

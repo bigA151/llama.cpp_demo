@@ -12,11 +12,64 @@
 
 #include <cassert>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <numeric>
 #include <sstream>
+#include <unordered_map>
 #include <unordered_set>
 #include <iostream>
+
+static void llama_ssd_expert_wave_ids_marker(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    GGML_UNUSED(nth);
+    GGML_UNUSED(userdata);
+    if (ith != 0) {
+        return;
+    }
+
+    const ggml_tensor * ids = dst->src[0];
+    GGML_ASSERT(ids != nullptr && ids->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(ids) && ggml_is_contiguous(dst));
+    GGML_ASSERT(ggml_are_same_shape(ids, dst));
+    memcpy(dst->data, ids->data, ggml_nbytes(ids));
+}
+
+static void llama_ssd_expert_wave_mask(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    GGML_UNUSED(nth);
+    GGML_UNUSED(userdata);
+    if (ith != 0) {
+        return;
+    }
+
+    uint32_t wave = 0;
+    uint32_t capacity = 0;
+    int layer = -1;
+    int parsed = 0;
+    const int n = sscanf(ggml_get_name(dst), "ffn_moe_wave_mask_%u_%u-%d%n", &wave, &capacity, &layer, &parsed);
+    GGML_ASSERT(n == 3 && parsed > 0 && ggml_get_name(dst)[parsed] == '\0');
+    GGML_ASSERT(capacity > 0 && layer >= 0);
+
+    const ggml_tensor * ids = dst->src[0];
+    GGML_ASSERT(ids != nullptr && ids->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(ids) && ggml_is_contiguous(dst));
+    GGML_ASSERT(ggml_nelements(ids) == ggml_nelements(dst));
+
+    const int32_t * ids_data = (const int32_t *) ids->data;
+    float * mask = (float *) dst->data;
+    const int64_t n_ids = ggml_nelements(ids);
+
+    std::unordered_map<int32_t, uint32_t> expert_wave;
+    expert_wave.reserve((size_t) n_ids);
+    uint32_t n_unique = 0;
+    for (int64_t i = 0; i < n_ids; ++i) {
+        const int32_t expert = ids_data[i];
+        auto result = expert_wave.emplace(expert, n_unique / capacity);
+        if (result.second) {
+            ++n_unique;
+        }
+        mask[i] = result.first->second == wave ? 1.0f : 0.0f;
+    }
+}
 
 // dedup helpers
 
@@ -1437,6 +1490,40 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(cur, "ffn_moe_weighted", il);
     }
 
+    const uint32_t n_slots = cparams.n_ssd_expert_cache;
+    const uint64_t n_touch_max = std::min<uint64_t>((uint64_t) n_expert,
+            (uint64_t) n_tokens * (uint64_t) n_expert_used);
+    // The last transformer layer can be pruned to zero output tokens for intermediate
+    // prompt ubatches. Keep that empty subgraph on the original no-op MoE path.
+    const bool ssd_expert_cache = n_tokens > 0 && arch == LLM_ARCH_QWEN35MOE &&
+            n_slots >= (uint32_t) n_expert_used &&
+            n_slots < (uint32_t) n_expert && gate_exps != nullptr && up_exps != nullptr &&
+            down_exps != nullptr && gate_up_exps == nullptr;
+    const bool ssd_expert_waves = ssd_expert_cache && n_touch_max > n_slots;
+
+    uint32_t n_stream_waves = 1;
+    uint32_t stream_wave_capacity = n_slots;
+    if (ssd_expert_waves) {
+        stream_wave_capacity = n_slots > (uint32_t) n_expert_used ?
+                (n_slots - (uint32_t) n_expert_used) / 2 : 0;
+        if (stream_wave_capacity < (uint32_t) n_expert_used) {
+            GGML_ABORT("SSD expert cache needs at least 3*n_expert_used slots for wave prefill "
+                       "(have %u, need %u)", n_slots, 3 * (uint32_t) n_expert_used);
+        }
+        n_stream_waves = (uint32_t) ((n_touch_max + stream_wave_capacity - 1) / stream_wave_capacity);
+    }
+
+    auto cb_expert = [&](ggml_tensor * tensor, const char * name, uint32_t wave) {
+        if (!ssd_expert_waves) {
+            cb(tensor, name, il);
+            return;
+        }
+        char wave_name[GGML_MAX_NAME];
+        snprintf(wave_name, sizeof(wave_name), "%s_wave_%u_%u", name, wave, stream_wave_capacity);
+        cb(tensor, wave_name, il);
+    };
+
+    auto build_expert_gemms = [&](ggml_tensor * cur, ggml_tensor * ids_gemm, uint32_t stream_wave) -> ggml_tensor * {
     ggml_tensor * up = nullptr;
     ggml_tensor * experts = nullptr;
 
@@ -1444,8 +1531,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //该实验的up、gate权重矩阵分开存放在两个文件中(up_exps/gate_exps)，因此进入else分支
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
-        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts); // [n_ff*2, n_expert_used, n_tokens]
-        cb(gate_up, "ffn_moe_gate_up", il);
+        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, ids_gemm); // [n_ff*2, n_expert_used, n_tokens]
+        cb_expert(gate_up, "ffn_moe_gate_up", stream_wave);
 
         if (gate_up_exps_b) {
             gate_up = ggml_add_id(ctx0, gate_up, gate_up_exps_b, selected_experts);
@@ -1470,8 +1557,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     else {
         // std::cout << ggml_get_name(up_exps) << " bytes:" << ggml_nbytes(up_exps) << std::endl;
         // separate gate and up path
-        up = build_lora_mm_id(up_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
-        cb(up, "ffn_moe_up", il);
+        up = build_lora_mm_id(up_exps, cur, ids_gemm); // [n_ff, n_expert_used, n_tokens]
+        cb_expert(up, "ffn_moe_up", stream_wave);
 
         if (up_exps_b) {
             up = ggml_add_id(ctx0, up, up_exps_b, selected_experts);
@@ -1490,8 +1577,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         //进一步判断:如果参数中有gate_exps矩阵，则此时更新cur代表gate(注意是专家组成部分之一的gate而不是门控gate)，否则cur=up
         if (gate_exps) {
             // std::cout << ggml_get_name(gate_exps) << " bytes:" << ggml_nbytes(gate_exps) << std::endl;
-            cur = build_lora_mm_id(gate_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
-            cb(cur, "ffn_moe_gate", il);
+            cur = build_lora_mm_id(gate_exps, cur, ids_gemm); // [n_ff, n_expert_used, n_tokens]
+            cb_expert(cur, "ffn_moe_gate", stream_wave);
         } else {
             cur = up;
         }
@@ -1584,8 +1671,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     // std::cout << ggml_get_name(down_exps) << " bytes:" << ggml_nbytes(down_exps) << std::endl;
-    experts = build_lora_mm_id(down_exps, cur, selected_experts); // [n_embd, n_expert_used, n_tokens]
-    cb(experts, "ffn_moe_down", il);
+    experts = build_lora_mm_id(down_exps, cur, ids_gemm); // [n_embd, n_expert_used, n_tokens]
+    cb_expert(experts, "ffn_moe_down", stream_wave);
 
     if (down_exps_b) {
         experts = ggml_add_id(ctx0, experts, down_exps_b, selected_experts);
@@ -1599,6 +1686,48 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         s = ggml_get_rows(ctx0, s, selected_experts); // [1, n_expert_used, n_tokens]
         experts = ggml_mul(ctx0, experts, s);
         cb(experts, "ffn_moe_down_scaled", il);
+    }
+
+    return experts;
+    };
+
+    ggml_tensor * experts = nullptr;
+    if (ssd_expert_waves) {
+        ggml_tensor * ids_cont = ggml_cont(ctx0, selected_experts);
+        cb(ids_cont, "ffn_moe_topk_cont", il);
+
+        for (uint32_t stream_wave = 0; stream_wave < n_stream_waves; ++stream_wave) {
+            ggml_tensor * args[2] = { ids_cont, nullptr };
+            int n_args = 1;
+            if (experts != nullptr) {
+                // Keep cache rewrites ordered after the previous wave consumed its slots.
+                args[1] = ggml_view_1d(ctx0, experts, 1, 0);
+                n_args = 2;
+            }
+
+            ggml_tensor * ids_wave = ggml_custom_4d(ctx0, GGML_TYPE_I32,
+                    n_expert_used, n_tokens, 1, 1, args, n_args,
+                    llama_ssd_expert_wave_ids_marker, 1, nullptr);
+            char ids_name[GGML_MAX_NAME];
+            snprintf(ids_name, sizeof(ids_name), "ffn_moe_wave_ids_%u_%u", stream_wave, stream_wave_capacity);
+            cb(ids_wave, ids_name, il);
+
+            ggml_tensor * experts_wave = build_expert_gemms(cur, ids_wave, stream_wave);
+
+            ggml_tensor * mask_args[1] = { ids_cont };
+            ggml_tensor * mask = ggml_custom_4d(ctx0, GGML_TYPE_F32,
+                    1, n_expert_used, n_tokens, 1, mask_args, 1,
+                    llama_ssd_expert_wave_mask, 1, nullptr);
+            char mask_name[GGML_MAX_NAME];
+            snprintf(mask_name, sizeof(mask_name), "ffn_moe_wave_mask_%u_%u", stream_wave, stream_wave_capacity);
+            cb(mask, mask_name, il);
+
+            experts_wave = ggml_mul(ctx0, experts_wave, mask);
+            cb(experts_wave, "ffn_moe_wave_masked", il);
+            experts = experts == nullptr ? experts_wave : ggml_add(ctx0, experts, experts_wave);
+        }
+    } else {
+        experts = build_expert_gemms(cur, selected_experts, 0);
     }
 
     if (!weight_before_ffn) {

@@ -323,6 +323,8 @@ private:
     ggml_cgraph * eval_graph = nullptr;
     std::set<ggml_tensor *> eval_callback_user_requested;
     std::vector<int32_t> ssd_expert_argsort;
+    int ssd_expert_argsort_layer = -1;
+    ggml_backend_t ssd_expert_cache_backend = nullptr;
     std::vector<int32_t> moe_argsort_previous_topk;
     std::array<uint64_t, 8> moe_argsort_overlap_sum = {};
     uint64_t moe_argsort_overlap_count = 0;

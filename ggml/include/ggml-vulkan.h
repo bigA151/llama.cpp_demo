@@ -50,6 +50,9 @@ struct ggml_vk_ssd_expert_cache_load {
 struct ggml_vk_ssd_expert_cache_plan {
     int layer;
     uint32_t n_hot_expert;
+    uint32_t wave;
+    uint32_t wave_capacity;
+    bool allow_resident_topk_fallback;
     const int32_t * argsort;
     size_t n_tokens;
     const int32_t * expert_map;
@@ -79,6 +82,16 @@ struct ggml_vk_ssd_expert_provider {
 GGML_BACKEND_API void ggml_backend_vk_set_ssd_expert_provider(
         ggml_backend_t backend,
         const struct ggml_vk_ssd_expert_provider * provider);
+
+GGML_BACKEND_API bool ggml_backend_vk_apply_ssd_expert_cache_wave(
+        ggml_backend_t backend,
+        struct ggml_cgraph * cgraph,
+        int layer,
+        uint32_t wave,
+        uint32_t wave_capacity,
+        const int32_t * argsort,
+        size_t n_tokens,
+        struct ggml_tensor * mapped_topk);
 
 GGML_BACKEND_API bool ggml_backend_vk_apply_ssd_expert_cache(
         ggml_backend_t backend,
