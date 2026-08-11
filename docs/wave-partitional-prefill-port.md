@@ -26,14 +26,14 @@ Wave-Partitional Prefill 不再缩小用户设置的 ubatch。它把一次 MoE e
 
 本次修改不是直接覆盖现有实现，而是在以下历史功能上继续演进：
 
-- `4f66971f08ef32f54cff72b3e6bae017e788d0ba`（`topk+8`）：decode/small-ubatch 路径会优先用排名 9～16 中已驻留的 expert 替换 top-8 中的冷 expert，以减少 SSD 读取。
+- `4f66971f08ef32f54cff72b3e6bae017e788d0ba`（`topk+8`）：曾让 decode/small-ubatch 路径用排名 9～16 中已驻留的 expert 替换 top-8 中的冷 expert，以减少 SSD 读取。
 - `71c9648ea`：让 `mapped_topk_tensor` 的 token 维度可随 `n_tokens` 调整，解决早期实现只能安全处理 `-ub 1` 的问题。
 - `24c39583d`：把 SSD cache planning 从 Vulkan 后端移动到 `llama_context` 的 eval callback，并增加 intermediate synchronize。
 - `4b659b3cd`：当前移植前的 `ZHW` 基线，包含 MoE 相邻层 expert 重合率统计。
 
 `24c39583d` 已经删除了 `4f66971f` 的 resident `topk+8` 回退逻辑，而且把每层 direct cache 更新都变成 scheduler callback 观察点。对单 token decode 来说，这会产生大量分段提交和同步。
 
-本次修改恢复了历史 direct 快速路径及 `topk+8` 行为，同时仅把真正需要分 wave 的大 ubatch 留在 callback 路径。
+本次修改只恢复历史 direct 的图内 cache 更新方式，不恢复 `topk+8` 的近似替换行为；真正需要分 wave 的大 ubatch 留在 callback 路径。
 
 ## 3. direct 与 wave 的分流
 
@@ -56,7 +56,7 @@ direct 路径用于 decode 和能够由 cache 一次容纳的小 ubatch：
 
 - 保持原有 `ffn_moe_gate/up/down-<layer>` 节点命名。
 - 在 Vulkan graph compute 内读取 argsort、更新 `expert_map`、加载缺失 expert，并把 expert id 映射为 slot id。
-- 启用已有的 resident `topk+8` 回退，以维持该分支原来的 decode 策略。
+- 始终使用 router 真实选中的 top-k expert，不执行 resident `topk+8` 回退。
 - 图结束时同步并释放本次 direct 图的 Vulkan graph-lifetime context。
 
 最后一点用于修复长文本配合 `-ub 1` 时的 `0xC0000409` fail-fast。`24c39583d` 引入的 intermediate synchronize 会保留 graph-lifetime 资源；在一次 `llama_decode()` 内连续处理数百个 single-token ubatch 时，这些资源会持续累积。direct 图完成后显式同步和 cleanup 可以安全结束其生命周期，避免累计越界，同时不影响 wave callback 仍在使用的图资源。
@@ -80,7 +80,7 @@ wave 路径用于可能触及的 expert 数超过 slot 数的大 ubatch：
 
 预留空间用于每个 token 的有效、互不重复 parking slot 以及 wave 切换期间的 cache 安全操作。若 slot 数不足以支持 wave，会在构图时明确终止，而不是产生无效映射。
 
-wave 路径不执行 resident `topk+8` 替换。它计算 router 实际选中的 top-k expert，只通过分 wave 改变执行顺序，避免在长 prefill 中引入额外的近似路由。
+direct 和 wave 路径都不执行 resident `topk+8` 替换。两者都计算 router 实际选中的 top-k expert；wave 只改变执行顺序，不引入近似路由。
 
 ## 4. `expert_map` 和节点查找
 
@@ -127,7 +127,7 @@ cache planner 会验证：
   - 构造 wave marker、mask、分 wave expert GEMM 和输出累加。
   - 小 ubatch 保持 direct 图。
 - `src/llama-context.cpp`
-  - cache planning、wave argsort callback、resident `topk+8` 回退和零 token 校验。
+  - cache planning、wave argsort callback、真实 top-k 映射和零 token 校验。
   - 移除 SSD cache 对 `n_ubatch` 的强制缩小。
 - `src/llama-context.h`
   - 保存当前 wave callback 使用的 argsort layer/backend 状态。
@@ -177,10 +177,10 @@ D:\model\Qwen3.5-35B-A3B-Q4_K_M.gguf
 exit code        = 0
 processed tokens = 523 / 523
 graph splits     = 2
-prompt speed     = 26.32 tokens/s
+prompt speed     = 14.37 tokens/s
 ```
 
-该速度与保留 `topk+8` 的 `71c9648ea` Release 基线实测 26.20 tokens/s 基本一致，说明 direct/decode 路径的性能特征已恢复。
+该测试验证了 direct 图内 cache 更新和长 single-token ubatch 的资源清理；本实现不会用 resident expert 替换 router 选中的 expert。与启用近似替换时相比，真实 top-k 会产生更多 SSD cache miss，因此 `-ub 1` 速度下降属于预期代价。
 
 ### 8.2 `-ub 512`
 
@@ -194,7 +194,7 @@ prompt speed     = 26.32 tokens/s
 exit code        = 0
 processed tokens = 523 / 523
 graph splits     = 482 (bs=512), 2 (bs=1)
-prompt speed     = 59.51 tokens/s
+prompt speed     = 70.09 tokens/s
 ```
 
 两个测试均启用默认 warmup，未出现 compute error、零行 wave tensor 错误或 Windows fail-fast。

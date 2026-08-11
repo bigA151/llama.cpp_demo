@@ -121,8 +121,6 @@ static bool llama_vk_ssd_expert_prepare_cache(
     for (size_t token = 0; token < plan->n_tokens; ++token) {
         const size_t argsort_offset = token * n_expert;
         const size_t topk_offset = token * n_expert_used;
-        std::vector<uint32_t> cold_positions;
-        std::vector<int32_t> replacement_experts;
 
         for (uint32_t topk = 0; topk < n_expert_used; ++topk) {
             const int expert = plan->argsort[argsort_offset + topk];
@@ -131,31 +129,6 @@ static bool llama_vk_ssd_expert_prepare_cache(
                 return false;
             }
             selected_topk[topk_offset + topk] = expert;
-        }
-
-        if (plan->allow_resident_topk_fallback) {
-            for (int topk = (int) n_expert_used - 1; topk >= 0; --topk) {
-                if (plan->expert_map[selected_topk[topk_offset + topk]] == expert_not_loaded) {
-                    cold_positions.push_back((uint32_t) topk);
-                }
-            }
-
-            const uint32_t candidate_end = std::min(n_expert, 2 * n_expert_used);
-            for (uint32_t rank = n_expert_used; rank < candidate_end; ++rank) {
-                const int expert = plan->argsort[argsort_offset + rank];
-                if (expert < 0 || expert >= (int) n_expert) {
-                    LLAMA_LOG_ERROR("%s: invalid fallback expert %d for token %zu\n", __func__, expert, token);
-                    return false;
-                }
-                if (plan->expert_map[expert] != expert_not_loaded) {
-                    replacement_experts.push_back(expert);
-                }
-            }
-
-            const size_t replacement_count = std::min(cold_positions.size(), replacement_experts.size());
-            for (size_t i = 0; i < replacement_count; ++i) {
-                selected_topk[topk_offset + cold_positions[i]] = replacement_experts[i];
-            }
         }
     }
 

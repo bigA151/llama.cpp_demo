@@ -52,7 +52,6 @@ struct ggml_vk_ssd_expert_cache_plan {
     uint32_t n_hot_expert;
     uint32_t wave;
     uint32_t wave_capacity;
-    bool allow_resident_topk_fallback;
     const int32_t * argsort;
     size_t n_tokens;
     const int32_t * expert_map;

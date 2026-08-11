@@ -14849,7 +14849,6 @@ static bool hot_expert_offload_process(
         int      layer_id,
         uint32_t wave,
         uint32_t wave_capacity,
-        bool     allow_resident_topk_fallback,
         size_t   n_tokens) {
     const bool ssd_timing = ssd_expert_timing_capture_active();
     if (ssd_timing) {
@@ -14882,7 +14881,6 @@ static bool hot_expert_offload_process(
         /* .n_hot_expert         = */ om_519.n_hot_expert,
         /* .wave                 = */ wave,
         /* .wave_capacity        = */ wave_capacity,
-        /* .allow_resident_topk_fallback = */ allow_resident_topk_fallback,
         /* .argsort              = */ om_519.argsort_buffer.data(),
         /* .n_tokens             = */ n_tokens,
         /* .expert_map           = */ expert_map.data(),
@@ -15461,7 +15459,7 @@ bool ggml_backend_vk_apply_ssd_expert_cache_wave(
     const size_t argsort_elements = n_tokens * om_519.n_expert;
     om_519.argsort_buffer.assign(argsort, argsort + argsort_elements);
 
-    if (!hot_expert_offload_process(layer_id, wave, wave_capacity, false, n_tokens)) {
+    if (!hot_expert_offload_process(layer_id, wave, wave_capacity, n_tokens)) {
         return false;
     }
 
@@ -15537,7 +15535,7 @@ bool ggml_backend_vk_apply_ssd_expert_cache(
         return false;
     }
 
-    if (!hot_expert_offload_process(layer_id, 0, om_519.n_hot_expert, true, n_tokens)) {
+    if (!hot_expert_offload_process(layer_id, 0, om_519.n_hot_expert, n_tokens)) {
         return false;
     }
 
