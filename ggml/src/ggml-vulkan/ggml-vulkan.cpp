@@ -41,6 +41,7 @@ DispatchLoaderDynamic & ggml_vk_default_dispatcher();
 #include <memory>
 #include <mutex>
 #include <future>
+#include <fstream>
 #include <thread>
 
 #if defined(_MSC_VER)
@@ -14431,6 +14432,7 @@ int get_layer_id(ggml_tensor * tensor)
 }
 
 #define EXPERT_NOT_LOADED -1
+static constexpr const char * EXPERT_CACHE_EVICTION_STRATEGY = "lru_lfu";
 
 typedef struct {
     ggml_backend_t backend;
@@ -14449,6 +14451,19 @@ typedef struct {
     std::vector<std::vector<uint64_t>> expert_last_access;
     std::vector<std::vector<uint32_t>> expert_access_count;
     std::vector<uint64_t> layer_steps;
+
+    std::vector<uint64_t> decode_expert_hits;
+    std::vector<uint64_t> decode_expert_requests;
+    std::vector<uint64_t> decode_step_layer_hits;
+    std::vector<uint64_t> decode_step_layer_requests;
+    uint64_t decode_step_hits;
+    uint64_t decode_step_requests;
+    uint64_t decode_total_hits;
+    uint64_t decode_total_requests;
+    uint64_t decode_token_index;
+    bool decode_prefill_seen;
+    std::ofstream decode_summary_csv;
+    std::ofstream decode_layer_csv;
 
     struct ggml_context * offload_ctx; //need a ctx to create tensors
 
@@ -14666,6 +14681,13 @@ static bool offload_expert_and_map_init(void) {
     return true;
 }
 
+#if 0 // Decode hit-rate CSV output disabled for decode-speed benchmarking.
+static bool offload_expert_csv_is_empty(const char * path) {
+    std::ifstream input(path, std::ios::binary | std::ios::ate);
+    return !input.is_open() || input.tellg() == std::streampos(0);
+}
+#endif
+
 static bool offload_expert_buffer_manager_init(ggml_backend_t backend) {
     GOOFY_VK_LOG_DEBUG("offload_expert_buffer_manager_init");
 
@@ -14699,6 +14721,30 @@ static bool offload_expert_buffer_manager_init(ggml_backend_t backend) {
                 provider.n_expert, std::numeric_limits<uint64_t>::max()));
     om_519.expert_access_count.assign(n_layer, std::vector<uint32_t>(provider.n_expert, 0));
     om_519.layer_steps.assign(n_layer, 0);
+#if 0 // Decode hit-rate accounting and CSV output disabled for speed comparison.
+    om_519.decode_expert_hits.assign(n_layer, 0);
+    om_519.decode_expert_requests.assign(n_layer, 0);
+    om_519.decode_step_layer_hits.assign(n_layer, 0);
+    om_519.decode_step_layer_requests.assign(n_layer, 0);
+    om_519.decode_step_hits = 0;
+    om_519.decode_step_requests = 0;
+    om_519.decode_total_hits = 0;
+    om_519.decode_total_requests = 0;
+    om_519.decode_token_index = 0;
+    om_519.decode_prefill_seen = false;
+    const bool summary_csv_is_empty = offload_expert_csv_is_empty("expert_cache_decode_summary.csv");
+    const bool layer_csv_is_empty = offload_expert_csv_is_empty("expert_cache_decode_layer.csv");
+    om_519.decode_summary_csv.open("expert_cache_decode_summary.csv", std::ios::app);
+    om_519.decode_layer_csv.open("expert_cache_decode_layer.csv", std::ios::app);
+    if (summary_csv_is_empty) {
+        om_519.decode_summary_csv << "strategy,decode_token,cache_slots,topk,layers,hits,requests,hit_rate\n";
+        om_519.decode_summary_csv.flush();
+    }
+    if (layer_csv_is_empty) {
+        om_519.decode_layer_csv << "strategy,decode_token,layer,hits,requests,hit_rate\n";
+        om_519.decode_layer_csv.flush();
+    }
+#endif
     om_519.argsort_buffer.resize(provider.n_expert);
     om_519.topk_buffer.resize(provider.n_expert_used);
     om_519.gating_scores_buffer.resize(provider.n_expert);
@@ -14725,7 +14771,7 @@ static uint64_t offload_expert_access_age(
     return step >= last_access[expert] ? step - last_access[expert] + 1 : 1;
 }
 
-static int offload_expert_select_victim(
+static int offload_expert_select_victim_lru_lfu(
         int layer_id,
         const std::vector<bool> & required) {
     auto & expert_map   = om_519.expert_map[layer_id];
@@ -14787,6 +14833,112 @@ static void offload_expert_record_accesses(
     }
 }
 
+#if 0 // Decode hit-rate accounting retained for later experiments.
+static bool offload_expert_record_decode_cache_hits(int layer_id, size_t n_tokens) {
+    // llama-cli evaluates one generated token at a time. Observe a multi-token prefill first
+    // so startup/warmup graphs are not reported as decode samples.
+    if (n_tokens > 1) {
+        om_519.decode_prefill_seen = true;
+        return true;
+    }
+    if (n_tokens != 1 || !om_519.decode_prefill_seen) {
+        return true;
+    }
+    const auto & expert_map = om_519.expert_map[layer_id];
+    uint64_t layer_hits = 0;
+
+    for (size_t token = 0; token < n_tokens; ++token) {
+        const size_t token_offset = token * om_519.n_expert;
+        for (uint32_t topk = 0; topk < om_519.n_expert_used; ++topk) {
+            const int expert = om_519.argsort_buffer[token_offset + topk];
+            if (expert < 0 || expert >= (int) om_519.n_expert) {
+                GGML_LOG_ERROR("%s: invalid routed expert %d at layer %d token %zu top-k index %u\n",
+                        __func__, expert, layer_id, token, topk);
+                return false;
+            }
+
+            if (expert_map[expert] != EXPERT_NOT_LOADED) {
+                ++layer_hits;
+            }
+        }
+    }
+
+    const uint64_t layer_requests = n_tokens * om_519.n_expert_used;
+    om_519.decode_step_layer_hits[layer_id] += layer_hits;
+    om_519.decode_step_layer_requests[layer_id] += layer_requests;
+    om_519.decode_step_hits += layer_hits;
+    om_519.decode_step_requests += layer_requests;
+
+    GGML_LOG_DEBUG("%s: layer=%d hit rate=%llu/%llu\n", __func__, layer_id,
+            (unsigned long long) layer_hits, (unsigned long long) layer_requests);
+
+    return true;
+}
+
+static void offload_expert_report_decode_cache_hits(void) {
+    if (om_519.decode_step_requests == 0) {
+        return;
+    }
+
+    const uint64_t expected_layer_requests = om_519.n_expert_used;
+    const uint64_t expected_step_requests = (uint64_t) om_519.n_layer * expected_layer_requests;
+    const bool is_complete_decode_step =
+        om_519.decode_step_requests == expected_step_requests &&
+        om_519.decode_step_layer_requests.size() == om_519.n_layer &&
+        std::all_of(om_519.decode_step_layer_requests.begin(), om_519.decode_step_layer_requests.end(),
+                    [expected_layer_requests](uint64_t requests) { return requests == expected_layer_requests; });
+
+    if (!is_complete_decode_step) {
+        GGML_LOG_DEBUG("%s: ignored incomplete single-token graph: requests=%llu, expected=%llu\n",
+                __func__,
+                (unsigned long long) om_519.decode_step_requests,
+                (unsigned long long) expected_step_requests);
+        std::fill(om_519.decode_step_layer_hits.begin(), om_519.decode_step_layer_hits.end(), 0);
+        std::fill(om_519.decode_step_layer_requests.begin(), om_519.decode_step_layer_requests.end(), 0);
+        om_519.decode_step_hits = 0;
+        om_519.decode_step_requests = 0;
+        return;
+    }
+
+    om_519.decode_total_hits += om_519.decode_step_hits;
+    om_519.decode_total_requests += om_519.decode_step_requests;
+    for (uint32_t layer_id = 0; layer_id < om_519.n_layer; ++layer_id) {
+        om_519.decode_expert_hits[layer_id] += om_519.decode_step_layer_hits[layer_id];
+        om_519.decode_expert_requests[layer_id] += om_519.decode_step_layer_requests[layer_id];
+    }
+
+    const double step_hit_rate = 100.0 * om_519.decode_step_hits / om_519.decode_step_requests;
+    const double total_hit_rate = 100.0 * om_519.decode_total_hits / om_519.decode_total_requests;
+    GGML_LOG("%s: SSD expert cache decode hit rate: step=%llu/%llu (%.2f%%), cumulative=%llu/%llu (%.2f%%)\n",
+            __func__,
+            (unsigned long long) om_519.decode_step_hits,
+            (unsigned long long) om_519.decode_step_requests,
+            step_hit_rate,
+            (unsigned long long) om_519.decode_total_hits,
+            (unsigned long long) om_519.decode_total_requests,
+            total_hit_rate);
+    if (om_519.decode_summary_csv.is_open()) {
+        om_519.decode_summary_csv << EXPERT_CACHE_EVICTION_STRATEGY << ',' << om_519.decode_token_index << ','
+                << om_519.n_hot_expert << ',' << om_519.n_expert_used << ',' << om_519.n_layer << ','
+                << om_519.decode_step_hits << ',' << om_519.decode_step_requests << ','
+                << std::setprecision(8) << (double) om_519.decode_step_hits / om_519.decode_step_requests << '\n';
+        for (uint32_t layer_id = 0; layer_id < om_519.n_layer; ++layer_id) {
+            const uint64_t layer_hits = om_519.decode_step_layer_hits[layer_id];
+            om_519.decode_layer_csv << EXPERT_CACHE_EVICTION_STRATEGY << ',' << om_519.decode_token_index << ','
+                    << layer_id << ',' << layer_hits << ',' << expected_layer_requests << ','
+                    << std::setprecision(8) << (double) layer_hits / expected_layer_requests << '\n';
+        }
+        om_519.decode_summary_csv.flush();
+        om_519.decode_layer_csv.flush();
+    }
+    ++om_519.decode_token_index;
+    std::fill(om_519.decode_step_layer_hits.begin(), om_519.decode_step_layer_hits.end(), 0);
+    std::fill(om_519.decode_step_layer_requests.begin(), om_519.decode_step_layer_requests.end(), 0);
+    om_519.decode_step_hits = 0;
+    om_519.decode_step_requests = 0;
+}
+#endif
+
 
 // judge if the routed experts are in VRAM; load and map them if necessary
 static bool hot_expert_offload_process(
@@ -14821,6 +14973,13 @@ static bool hot_expert_offload_process(
 
     GGML_LOG_DEBUG("%s: layer=%d n_expert=%u n_expert_used=%u n_hot_expert=%u\n",
         __func__, layer_id, om_519.n_expert, om_519.n_expert_used, om_519.n_hot_expert);
+
+#if 0 // Decode hit-rate accounting disabled for speed comparison.
+    // Count the router's original top-k decision before substitution or cache updates.
+    if (!offload_expert_record_decode_cache_hits(layer_id, n_tokens)) {
+        return false;
+    }
+#endif
 
     if (om_519.enable_topk_substitution) {
         // Consider the next top-k experts after the selected set. For
@@ -14947,7 +15106,22 @@ static bool hot_expert_offload_process(
     }
 
     for (const int cur_expert_id : missing) {
-        const int expert_rm_idx = offload_expert_select_victim(layer_id, required);
+        const int expert_rm_idx = offload_expert_select_victim_lru_lfu(layer_id, required);
+        /*
+         * Router-rank greedy policy (9abcb1d), disabled for this run:
+         * int expert_rm_idx = -1;
+         * for (int rank = (int) om_519.n_expert - 1;
+         *         rank >= (int) om_519.n_expert_used && expert_rm_idx == -1;
+         *         --rank) {
+         *     for (size_t token = 0; token < n_tokens; ++token) {
+         *         const int candidate = om_519.argsort_buffer[token * om_519.n_expert + rank];
+         *         if (!required[candidate] && expert_map[candidate] != EXPERT_NOT_LOADED) {
+         *             expert_rm_idx = candidate;
+         *             break;
+         *         }
+         *     }
+         * }
+         */
         if (expert_rm_idx == -1) {
             GGML_LOG_ERROR("%s: no resident expert is available for eviction\n", __func__);
             return false;
@@ -14981,6 +15155,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             return GGML_STATUS_FAILED;
         }
     }
+
+#if 0 // Decode hit-rate accounting disabled for speed comparison.
+    om_519.decode_step_hits = 0;
+    om_519.decode_step_requests = 0;
+    std::fill(om_519.decode_step_layer_hits.begin(), om_519.decode_step_layer_hits.end(), 0);
+    std::fill(om_519.decode_step_layer_requests.begin(), om_519.decode_step_layer_requests.end(), 0);
+#endif
 
     if (vk_instance.debug_utils_support) {
         vk::DebugUtilsLabelEXT dul = {};
@@ -15491,6 +15672,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
         }
     }
+
+#if 0 // Decode hit-rate logging and CSV output disabled for speed comparison.
+    offload_expert_report_decode_cache_hits();
+#endif
 
     ctx->last_total_mul_mat_bytes = total_mul_mat_bytes;
 
