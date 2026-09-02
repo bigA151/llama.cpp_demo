@@ -36,6 +36,7 @@ struct llama_cparams {
     bool fused_gdn_ch;       // use fused gated delta net (chunked)
     bool auto_fgdn;
     bool no_perf;
+    bool perf_trace;
     bool warmup;
     bool op_offload;
     bool kv_unified;

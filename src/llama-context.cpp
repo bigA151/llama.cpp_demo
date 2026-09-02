@@ -17,6 +17,7 @@
 
 #include <cinttypes>
 #include <cmath>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -35,19 +36,27 @@ static bool llama_vk_ssd_expert_read(
         int    kind,
         void * dst,
         size_t n_bytes) {
-    const llama_model * model = static_cast<const llama_model *>(user_data);
-    if (model == nullptr) {
+    const llama_context * ctx = static_cast<const llama_context *>(user_data);
+    if (ctx == nullptr) {
         return false;
     }
+    const llama_model & model = ctx->get_model();
 
     const llama_ssd_expert_tensor_kind wanted_kind = static_cast<llama_ssd_expert_tensor_kind>(kind);
-    for (const auto & addr : model->ssd_expert_addrs()) {
+    for (const auto & addr : model.ssd_expert_addrs()) {
         if ((int) addr.layer != layer || (int) addr.expert != expert || addr.kind != wanted_kind) {
             continue;
         }
 
         try {
-            model->ssd_expert_data(addr, dst, n_bytes);
+            const auto start = std::chrono::steady_clock::now();
+            model.ssd_expert_data(addr, dst, n_bytes);
+            if (ctx->get_cparams().perf_trace) {
+                const auto elapsed = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - start).count();
+                LLAMA_LOG_INFO("[PERF_TRACE][expert_data_fetch] layer=%d expert=%d kind=%d bytes=%zu elapsed=%.3f ms\n",
+                        layer, expert, kind, n_bytes, elapsed);
+            }
             return true;
         } catch (const std::exception & err) {
             LLAMA_LOG_ERROR("%s: failed to read SSD expert slice layer=%d expert=%d kind=%d n_bytes=%zu: %s\n",
@@ -66,13 +75,14 @@ static bool llama_vk_ssd_expert_get_tensor_info(
         int    layer,
         int    kind,
         ggml_vk_ssd_expert_tensor_info * info) {
-    const llama_model * model = static_cast<const llama_model *>(user_data);
-    if (model == nullptr || info == nullptr) {
+    const llama_context * ctx = static_cast<const llama_context *>(user_data);
+    if (ctx == nullptr || info == nullptr) {
         return false;
     }
+    const llama_model & model = ctx->get_model();
 
     const llama_ssd_expert_tensor_kind wanted_kind = static_cast<llama_ssd_expert_tensor_kind>(kind);
-    for (const auto & addr : model->ssd_expert_addrs()) {
+    for (const auto & addr : model.ssd_expert_addrs()) {
         if ((int) addr.layer != layer || addr.expert != 0 || addr.kind != wanted_kind) {
             continue;
         }
@@ -92,14 +102,17 @@ static bool llama_vk_ssd_expert_get_tensor_info(
 static bool llama_vk_ssd_expert_prepare_cache(
         void * user_data,
         ggml_vk_ssd_expert_cache_plan * plan) {
-    const llama_model * model = static_cast<const llama_model *>(user_data);
-    if (model == nullptr || plan == nullptr) {
+    const llama_context * ctx = static_cast<const llama_context *>(user_data);
+    if (ctx == nullptr || plan == nullptr) {
         return false;
     }
+    const llama_model & model = ctx->get_model();
+    const bool perf_trace = ctx->get_cparams().perf_trace;
+    const auto total_start = perf_trace ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
 
-    const uint32_t n_layer       = model->hparams.n_layer - model->hparams.nextn_predict_layers;
-    const uint32_t n_expert      = model->hparams.n_expert;
-    const uint32_t n_expert_used = model->hparams.n_expert_used;
+    const uint32_t n_layer       = model.hparams.n_layer - model.hparams.nextn_predict_layers;
+    const uint32_t n_expert      = model.hparams.n_expert;
+    const uint32_t n_expert_used = model.hparams.n_expert_used;
     const int32_t expert_not_loaded = -1;
 
     plan->n_loads = 0;
@@ -164,6 +177,7 @@ static bool llama_vk_ssd_expert_prepare_cache(
         return false;
     }
 
+    const auto slot_select_start = perf_trace ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
     std::vector<int32_t> next_map(plan->expert_map, plan->expert_map + n_expert);
     for (const int cur_expert_id : missing) {
         int expert_rm_idx = -1;
@@ -196,6 +210,9 @@ static bool llama_vk_ssd_expert_prepare_cache(
         next_map[cur_expert_id] = slot;
         next_map[expert_rm_idx] = expert_not_loaded;
     }
+
+    const auto slot_select_end = perf_trace ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
+    const auto map_update_start = perf_trace ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
 
     std::vector<int32_t> slot_expert(plan->n_hot_expert, expert_not_loaded);
     for (uint32_t expert = 0; expert < n_expert; ++expert) {
@@ -255,13 +272,26 @@ static bool llama_vk_ssd_expert_prepare_cache(
         }
     }
 
+    if (perf_trace) {
+        const auto end = std::chrono::steady_clock::now();
+        const auto elapsed_ms = [](const auto & begin, const auto & finish) {
+            return std::chrono::duration<double, std::milli>(finish - begin).count();
+        };
+        LLAMA_LOG_INFO("[PERF_TRACE][expert_cache_plan] layer=%d wave=%u/%u tokens=%zu unique=%zu required=%zu hits=%zu misses=%zu evictions=%zu route_scan=%.3f ms slot_select=%.3f ms map_update=%.3f ms total=%.3f ms\n",
+                plan->layer, plan->wave, plan->wave_capacity, plan->n_tokens, n_unique, n_required,
+                n_required - missing.size(), missing.size(), plan->n_loads,
+                elapsed_ms(total_start, slot_select_start), elapsed_ms(slot_select_start, slot_select_end),
+                elapsed_ms(map_update_start, end), elapsed_ms(total_start, end));
+    }
+
     return true;
 }
 
 static bool llama_vk_register_ssd_expert_provider(
-        const llama_model & model,
+        const llama_context & ctx,
         ggml_backend_t backend,
         uint32_t n_hot_expert) {
+    const llama_model & model = ctx.get_model();
     if (model.arch != LLM_ARCH_QWEN35MOE || !ggml_backend_is_vk(backend) || model.ssd_expert_addrs().empty()) {
         return false;
     }
@@ -272,7 +302,7 @@ static bool llama_vk_register_ssd_expert_provider(
     }
 
     ggml_vk_ssd_expert_provider provider = {
-        /* .user_data        = */ const_cast<llama_model *>(&model),
+        /* .user_data        = */ const_cast<llama_context *>(&ctx),
         /* .read             = */ llama_vk_ssd_expert_read,
         /* .get_tensor_info  = */ llama_vk_ssd_expert_get_tensor_info,
         /* .prepare_cache    = */ llama_vk_ssd_expert_prepare_cache,
@@ -393,7 +423,14 @@ bool llama_context::eval_callback(ggml_tensor * tensor, bool ask) {
                     keep_going = false;
                 } else {
                     ssd_expert_argsort.resize(n_elements);
+                    const auto host_copy_start = cparams.perf_trace ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
                     ggml_backend_tensor_get(tensor, ssd_expert_argsort.data(), 0, n_bytes);
+                    if (cparams.perf_trace) {
+                        const auto elapsed = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - host_copy_start).count();
+                        LLAMA_LOG_INFO("[PERF_TRACE][expert_argsort_host_copy] layer=%d tokens=%zu bytes=%zu elapsed=%.3f ms\n",
+                                layer, n_tokens, n_bytes, elapsed);
+                    }
                     ssd_expert_argsort_layer = layer;
                     ssd_expert_cache_backend = argsort_backend;
                 }
@@ -415,13 +452,23 @@ bool llama_context::eval_callback(ggml_tensor * tensor, bool ask) {
                     static_cast<long long>(tensor->ne[2]), static_cast<long long>(tensor->ne[3]));
             ssd_expert_cache_failed = true;
             keep_going = false;
-        } else if (!ggml_backend_vk_apply_ssd_expert_cache_wave(
+        } else {
+            const auto cache_apply_start = cparams.perf_trace ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
+            const bool cache_applied = ggml_backend_vk_apply_ssd_expert_cache_wave(
                     ssd_expert_cache_backend, eval_graph, wave_layer, wave, wave_capacity,
-                    ssd_expert_argsort.data(), n_tokens, tensor)) {
-            LLAMA_LOG_ERROR("%s: failed to apply SSD expert cache for layer %d wave %u\n",
-                    __func__, wave_layer, wave);
-            ssd_expert_cache_failed = true;
-            keep_going = false;
+                    ssd_expert_argsort.data(), n_tokens, tensor);
+            if (cparams.perf_trace) {
+                const auto elapsed = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - cache_apply_start).count();
+                LLAMA_LOG_INFO("[PERF_TRACE][expert_cache_apply_cpu] layer=%d wave=%u/%u tokens=%zu elapsed=%.3f ms\n",
+                        wave_layer, wave, wave_capacity, n_tokens, elapsed);
+            }
+            if (!cache_applied) {
+                LLAMA_LOG_ERROR("%s: failed to apply SSD expert cache for layer %d wave %u\n",
+                        __func__, wave_layer, wave);
+                ssd_expert_cache_failed = true;
+                keep_going = false;
+            }
         }
     }
 #endif
@@ -545,6 +592,7 @@ llama_context::llama_context(
     cparams.embeddings       = params.embeddings;
     cparams.offload_kqv      = params.offload_kqv;
     cparams.no_perf          = params.no_perf;
+    cparams.perf_trace       = params.perf_trace;
     cparams.pooling_type     = params.pooling_type;
     cparams.warmup           = false;
     cparams.n_ssd_expert_cache = 0;
@@ -753,7 +801,7 @@ llama_context::llama_context(
 #ifdef GGML_USE_VULKAN
         for (auto & backend : backends) {
             ssd_expert_cache_enabled |= llama_vk_register_ssd_expert_provider(
-                    model, backend.get(), params.n_ssd_expert_cache);
+                    *this, backend.get(), params.n_ssd_expert_cache);
         }
         if (ssd_expert_cache_enabled) {
             cparams.n_ssd_expert_cache = params.n_ssd_expert_cache;
@@ -1761,11 +1809,11 @@ llm_graph_result * llama_context::process_ubatch(
 #ifdef GGML_USE_VULKAN
     bool ssd_timing_capture = false;
     const bool ssd_timing_done = ssd_timing_prefill ? ssd_timing_prefill_done : ssd_timing_decode_done;
-    if (ssd_expert_cache_enabled && !ssd_timing_done) {
+    if (ssd_expert_cache_enabled && (cparams.perf_trace || !ssd_timing_done)) {
         for (const auto & backend : backends) {
             if (ggml_backend_is_vk(backend.get())) {
                 ssd_timing_capture |= ggml_backend_vk_ssd_timing_begin(
-                        backend.get(), ssd_timing_prefill, ubatch.n_tokens);
+                        backend.get(), ssd_timing_prefill, ubatch.n_tokens, cparams.perf_trace);
             }
         }
     }
@@ -3524,6 +3572,7 @@ llama_context_params llama_context_default_params() {
         /*.embeddings                  =*/ false,
         /*.offload_kqv                 =*/ true,
         /*.no_perf                     =*/ true,
+        /*.perf_trace                  =*/ false,
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,

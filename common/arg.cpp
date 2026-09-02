@@ -1383,6 +1383,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_PERF"));
     add_opt(common_arg(
+        {"--perf-trace"},
+        "emit detailed inference performance trace logs, including SSD expert cache planning and transfers",
+        [](common_params & params) {
+            params.perf_trace = true;
+            if (params.verbosity < LOG_LEVEL_INFO) {
+                params.verbosity = LOG_LEVEL_INFO;
+                common_log_set_verbosity_thold(LOG_LEVEL_INFO);
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_PERF_TRACE"));
+    add_opt(common_arg(
         {"--show-timings"},
         {"--no-show-timings"},
         string_format("whether to show timing information after each response (default: %s)", params.show_timings ? "true" : "false"),

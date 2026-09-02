@@ -268,11 +268,33 @@ struct ssd_vk_sync_timing_data {
     int64_t compute_submit_us = 0;
     int64_t fence_submit_us = 0;
     int64_t fence_wait_us = 0;
+    int64_t command_end_us = 0;
+    int64_t input_copy_us = 0;
+    int64_t queue_submit_us = 0;
     int64_t output_copy_us = 0;
     bool submitted_transfer = false;
     bool submitted_compute = false;
     bool waited = false;
 };
+
+// These scopes are enabled only around the direct SSD-expert cache transfers.
+// Host-visible Vulkan staging buffers are persistently mapped, so map/unmap are
+// intentionally reported as zero for each transfer rather than inferred.
+struct ssd_argsort_copy_timing_data {
+    bool active = false;
+    int64_t command_record_us = 0;
+    ssd_vk_sync_timing_data sync;
+};
+
+struct ssd_expert_upload_timing_data {
+    bool active = false;
+    int64_t cmd_begin_us = 0;
+    int64_t copy_record_us = 0;
+    ssd_vk_sync_timing_data sync;
+};
+
+static thread_local ssd_argsort_copy_timing_data ssd_argsort_copy_timing;
+static thread_local ssd_expert_upload_timing_data ssd_expert_upload_timing;
 
 struct ssd_vk_sync_timing_record {
     ssd_vk_sync_timing_data sync;
@@ -1953,6 +1975,21 @@ class vk_perf_logger {
     uint32_t print_count {};
 };
 
+enum class perf_trace_gpu_stage : uint8_t {
+    router_compute,
+    argsort,
+    expert_upload,
+    moe_compute,
+    attention,
+    count,
+};
+
+struct perf_trace_gpu_event {
+    perf_trace_gpu_stage stage;
+    uint32_t begin_query;
+    uint32_t end_query;
+};
+
 struct ggml_backend_vk_context {
     std::string name;
 
@@ -2022,10 +2059,127 @@ struct ggml_backend_vk_context {
     int32_t num_queries {};
     int32_t query_idx {};
 
+    // Per-graph Vulkan timestamps emitted for --perf-trace. This pool stays
+    // separate from GGML_VK_PERF_LOGGER so the two diagnostics can coexist.
+    vk::QueryPool perf_trace_query_pool;
+    uint32_t perf_trace_num_queries {};
+    uint32_t perf_trace_query_idx {};
+    bool perf_trace_gpu_active {};
+    bool perf_trace_gpu_overflow {};
+    std::vector<perf_trace_gpu_event> perf_trace_gpu_events;
+
     ggml_vk_ssd_expert_provider ssd_expert_provider {};
 };
 
 static void * const vk_ptr_base = (void *)(uintptr_t) 0x1000;  // NOLINT
+
+static perf_trace_gpu_stage ggml_vk_perf_trace_stage_for_node(const ggml_tensor * node) {
+    const char * name = ggml_get_name(node);
+    if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+        return perf_trace_gpu_stage::attention;
+    }
+    if (node->op == GGML_OP_ARGSORT || strncmp(name, "ffn_moe_argsort-", 16) == 0) {
+        return perf_trace_gpu_stage::argsort;
+    }
+    if (strncmp(name, "ffn_moe_logits-", 15) == 0 ||
+            strncmp(name, "ffn_moe_probs", 13) == 0 ||
+            strncmp(name, "ffn_moe_weights", 15) == 0 ||
+            strncmp(name, "ffn_moe_topk-", 13) == 0) {
+        return perf_trace_gpu_stage::router_compute;
+    }
+    if (strncmp(name, "ffn_moe_gate", 12) == 0 ||
+            strncmp(name, "ffn_moe_up", 10) == 0 ||
+            strncmp(name, "ffn_moe_down", 12) == 0 ||
+            strncmp(name, "ffn_moe_silu", 12) == 0) {
+        return perf_trace_gpu_stage::moe_compute;
+    }
+    return perf_trace_gpu_stage::count;
+}
+
+static void ggml_vk_perf_trace_reset(ggml_backend_vk_context * ctx, uint32_t min_queries) {
+    ctx->perf_trace_gpu_active = ctx->ssd_timing.active;
+    ctx->perf_trace_gpu_overflow = false;
+    ctx->perf_trace_gpu_events.clear();
+    ctx->perf_trace_query_idx = 0;
+    if (!ctx->perf_trace_gpu_active) {
+        return;
+    }
+
+    if (!ctx->perf_trace_query_pool || ctx->perf_trace_num_queries < min_queries) {
+        if (ctx->perf_trace_query_pool) {
+            ctx->device->device.destroyQueryPool(ctx->perf_trace_query_pool);
+        }
+        vk::QueryPoolCreateInfo query_create_info;
+        query_create_info.queryType = vk::QueryType::eTimestamp;
+        query_create_info.queryCount = min_queries;
+        ctx->perf_trace_query_pool = ctx->device->device.createQueryPool(query_create_info);
+        ctx->perf_trace_num_queries = min_queries;
+    }
+    ctx->device->device.resetQueryPool(ctx->perf_trace_query_pool, 0, ctx->perf_trace_num_queries);
+}
+
+static int32_t ggml_vk_perf_trace_begin(
+        ggml_backend_vk_context * ctx,
+        vk_context & subctx,
+        perf_trace_gpu_stage stage) {
+    if (!ctx->perf_trace_gpu_active || stage == perf_trace_gpu_stage::count || subctx->s == nullptr) {
+        return -1;
+    }
+    if (ctx->perf_trace_query_idx + 2 > ctx->perf_trace_num_queries) {
+        ctx->perf_trace_gpu_overflow = true;
+        return -1;
+    }
+    const uint32_t query = ctx->perf_trace_query_idx++;
+    subctx->s->buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eAllCommands, ctx->perf_trace_query_pool, query);
+    return static_cast<int32_t>(query);
+}
+
+static void ggml_vk_perf_trace_end(
+        ggml_backend_vk_context * ctx,
+        vk_context & subctx,
+        perf_trace_gpu_stage stage,
+        int32_t begin_query) {
+    if (begin_query < 0 || subctx->s == nullptr) {
+        return;
+    }
+    const uint32_t end_query = ctx->perf_trace_query_idx++;
+    subctx->s->buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eAllCommands, ctx->perf_trace_query_pool, end_query);
+    ctx->perf_trace_gpu_events.push_back({ stage, static_cast<uint32_t>(begin_query), end_query });
+}
+
+static void ggml_vk_perf_trace_log_gpu_stages(ggml_backend_vk_context * ctx) {
+    if (!ctx->perf_trace_gpu_active) {
+        return;
+    }
+
+    // Timestamp queries become readable only after both the compute and transfer
+    // submissions of this graph have completed.
+    ggml_vk_synchronize(ctx);
+
+    std::array<double, static_cast<size_t>(perf_trace_gpu_stage::count)> totals_ms {};
+    if (ctx->perf_trace_query_idx != 0) {
+        std::vector<uint64_t> timestamps(ctx->perf_trace_query_idx);
+        VK_CHECK(ctx->device->device.getQueryPoolResults(
+                ctx->perf_trace_query_pool, 0, ctx->perf_trace_query_idx,
+                timestamps.size() * sizeof(uint64_t), timestamps.data(), sizeof(uint64_t),
+                vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait),
+                "PERF_TRACE get timestamp results");
+        const double timestamp_period_ns = ctx->device->properties.limits.timestampPeriod;
+        for (const auto & event : ctx->perf_trace_gpu_events) {
+            totals_ms[static_cast<size_t>(event.stage)] +=
+                    (timestamps[event.end_query] - timestamps[event.begin_query]) * timestamp_period_ns / 1000000.0;
+        }
+    }
+
+    GGML_LOG_INFO("[PERF_TRACE][gpu_stages] router_compute_gpu_ms=%.3f argsort_gpu_ms=%.3f expert_upload_gpu_ms=%.3f moe_compute_gpu_ms=%.3f attention_gpu_ms=%.3f timestamp_overflow=%d\n",
+            totals_ms[static_cast<size_t>(perf_trace_gpu_stage::router_compute)],
+            totals_ms[static_cast<size_t>(perf_trace_gpu_stage::argsort)],
+            totals_ms[static_cast<size_t>(perf_trace_gpu_stage::expert_upload)],
+            totals_ms[static_cast<size_t>(perf_trace_gpu_stage::moe_compute)],
+            totals_ms[static_cast<size_t>(perf_trace_gpu_stage::attention)],
+            ctx->perf_trace_gpu_overflow ? 1 : 0);
+    ctx->perf_trace_gpu_active = false;
+}
 
 static uint64_t vk_tensor_offset(const ggml_tensor * tensor) {
     if (tensor->view_src) {
@@ -6693,12 +6847,17 @@ static void ggml_vk_ctx_end(vk_context& ctx) {
 
 static void ggml_vk_ctx_begin(vk_device& device, vk_context& subctx) {
     VK_LOG_DEBUG("ggml_vk_ctx_begin(" << device->name << ")");
+    const bool capture_upload = ssd_expert_upload_timing.active;
+    const int64_t start_us = capture_upload ? ssd_expert_timing_now_us() : 0;
     if (subctx->s != nullptr) {
         ggml_vk_ctx_end(subctx);
     }
 
     subctx->seqs.push_back({ ggml_vk_begin_submission(device, *subctx->p) });
     subctx->s = subctx->seqs[subctx->seqs.size() - 1].data();
+    if (capture_upload) {
+        ssd_expert_upload_timing.cmd_begin_us += ssd_expert_timing_now_us() - start_us;
+    }
 }
 
 static vk_context ggml_vk_get_compute_ctx(ggml_backend_vk_context * ctx) {
@@ -6723,22 +6882,36 @@ static vk_context ggml_vk_get_compute_ctx(ggml_backend_vk_context * ctx) {
 // Submit any pending transfer queue work and signal the transfer semaphore.
 // The next compute context created via ggml_vk_get_compute_ctx will wait on this semaphore.
 // Returns true if work was submitted.
-static bool ggml_vk_submit_transfer_ctx(ggml_backend_vk_context * ctx) {
+static bool ggml_vk_submit_transfer_ctx(
+        ggml_backend_vk_context * ctx,
+        ssd_vk_sync_timing_data * timing = nullptr) {
     if (!ctx->device->async_use_transfer_queue || ctx->transfer_ctx.expired()) {
         return false;
     }
 
     vk_context cpy_ctx = ctx->transfer_ctx.lock();
+    const int64_t cmd_end_start_us = timing != nullptr ? ssd_expert_timing_now_us() : 0;
     ggml_vk_ctx_end(cpy_ctx);
+    if (timing != nullptr) {
+        timing->command_end_us += ssd_expert_timing_now_us() - cmd_end_start_us;
+    }
 
+    const int64_t input_copy_start_us = timing != nullptr ? ssd_expert_timing_now_us() : 0;
     for (auto& cpy : cpy_ctx->in_memcpys) {
         memcpy(cpy.dst, cpy.src, cpy.n);
+    }
+    if (timing != nullptr) {
+        timing->input_copy_us += ssd_expert_timing_now_us() - input_copy_start_us;
     }
 
     ctx->transfer_semaphore.value++;
     cpy_ctx->seqs.back().back().signal_semaphores.push_back(ctx->transfer_semaphore);
 
+    const int64_t queue_submit_start_us = timing != nullptr ? ssd_expert_timing_now_us() : 0;
     ggml_vk_submit(cpy_ctx, {});
+    if (timing != nullptr) {
+        timing->queue_submit_us += ssd_expert_timing_now_us() - queue_submit_start_us;
+    }
     ctx->transfer_ctx.reset();
     return true;
 }
@@ -12949,7 +13122,7 @@ static void ggml_vk_compute_forward(ggml_backend_vk_context* ctx, ggml_cgraph * 
 
 // Returns true if node has enqueued work into the queue, false otherwise
 // If submit is true the current all operations queued so far are being submitted to Vulkan to overlap cmdlist creation and GPU execution.
-static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, int node_idx, ggml_tensor *node_begin, int node_idx_begin, bool last_node, bool almost_ready, bool submit){
+static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, int node_idx, ggml_tensor *node_begin, int node_idx_begin, bool last_node, bool almost_ready, bool submit, perf_trace_gpu_stage perf_trace_stage) {
     ggml_tensor * node = cgraph->nodes[node_idx];
     if (ggml_is_empty(node) || ggml_op_is_empty(node->op) || !node->buffer) {
         return false;
@@ -12982,6 +13155,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
     }
 
     vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
+    const int32_t perf_trace_begin_query = ggml_vk_perf_trace_begin(ctx, compute_ctx, perf_trace_stage);
 
     {
         // This logic detects dependencies between modes in the graph and calls ggml_vk_sync_buffers
@@ -13422,6 +13596,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         return false;
     }
 
+    ggml_vk_perf_trace_end(ctx, compute_ctx, perf_trace_stage, perf_trace_begin_query);
     ctx->tensor_ctxs[node_idx] = compute_ctx;
 
 #if defined(GGML_VULKAN_CHECK_RESULTS)
@@ -13560,6 +13735,10 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
         ctx->device->device.destroyEvent(event);
     }
     ctx->gc.events.clear();
+
+    if (ctx->perf_trace_query_pool) {
+        ctx->device->device.destroyQueryPool(ctx->perf_trace_query_pool);
+    }
 
     ctx->device->device.destroyFence(ctx->fence);
     ctx->device->device.destroyFence(ctx->almost_ready_fence);
@@ -13884,10 +14063,15 @@ static void ggml_backend_vk_set_tensor_async(ggml_backend_t backend, ggml_tensor
         cpy_ctx = ggml_vk_get_compute_ctx(ctx);
     }
 
+    const int32_t perf_trace_begin_query = ssd_expert_upload_timing.active ?
+            ggml_vk_perf_trace_begin(ctx, cpy_ctx, perf_trace_gpu_stage::expert_upload) : -1;
+
     vk_buffer buf = buf_ctx->dev_buffer;
 
     auto dst_offset = vk_tensor_offset(tensor) + tensor->view_offs + offset;
 
+    const bool capture_upload = ssd_expert_upload_timing.active;
+    const int64_t copy_record_start_us = capture_upload ? ssd_expert_timing_now_us() : 0;
     bool ret = ggml_vk_buffer_write_async(cpy_ctx, buf, dst_offset, data, size);
 
     if (!ret) {
@@ -13901,7 +14085,13 @@ static void ggml_backend_vk_set_tensor_async(ggml_backend_t backend, ggml_tensor
 
         cpy_ctx->s->buffer->buf.copyBuffer(ctx->sync_staging->buffer, buf->buffer, { buffer_cpy });
         deferred_memcpy(ctx->sync_staging->ptr, data, size, &cpy_ctx->in_memcpys);
-        ggml_vk_synchronize(ctx);
+    }
+    if (capture_upload) {
+        ssd_expert_upload_timing.copy_record_us += ssd_expert_timing_now_us() - copy_record_start_us;
+    }
+    ggml_vk_perf_trace_end(ctx, cpy_ctx, perf_trace_gpu_stage::expert_upload, perf_trace_begin_query);
+    if (!ret) {
+        ggml_vk_synchronize(ctx, capture_upload ? &ssd_expert_upload_timing.sync : nullptr);
     }
 }
 
@@ -13916,6 +14106,8 @@ static void ggml_backend_vk_get_tensor_async(ggml_backend_t backend, const ggml_
 
     ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
 
+    const bool capture_argsort = ssd_argsort_copy_timing.active;
+    const int64_t command_record_start_us = capture_argsort ? ssd_expert_timing_now_us() : 0;
     vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
 
     vk_buffer buf = buf_ctx->dev_buffer;
@@ -13935,7 +14127,12 @@ static void ggml_backend_vk_get_tensor_async(ggml_backend_t backend, const ggml_
 
         compute_ctx->s->buffer->buf.copyBuffer(buf->buffer, ctx->sync_staging->buffer, { buffer_cpy });
         deferred_memcpy(data, ctx->sync_staging->ptr, size, &compute_ctx->out_memcpys);
-        ggml_vk_synchronize(ctx);
+    }
+    if (capture_argsort) {
+        ssd_argsort_copy_timing.command_record_us += ssd_expert_timing_now_us() - command_record_start_us;
+    }
+    if (!ret) {
+        ggml_vk_synchronize(ctx, capture_argsort ? &ssd_argsort_copy_timing.sync : nullptr);
     }
 }
 
@@ -14009,7 +14206,7 @@ static void ggml_vk_synchronize(
     bool do_transfer = !ctx->compute_ctx.expired();
 
     const int64_t transfer_submit_start_us = timing != nullptr ? ssd_expert_timing_now_us() : 0;
-    const bool submitted_transfer = ggml_vk_submit_transfer_ctx(ctx);
+    const bool submitted_transfer = ggml_vk_submit_transfer_ctx(ctx, timing);
     if (timing != nullptr) {
         timing->transfer_submit_us += ssd_expert_timing_now_us() - transfer_submit_start_us;
         timing->submitted_transfer = submitted_transfer;
@@ -14027,13 +14224,25 @@ static void ggml_vk_synchronize(
             cmd_buf = compute_ctx->s->buffer;
         }
 
+        const int64_t cmd_end_start_us = timing != nullptr ? ssd_expert_timing_now_us() : 0;
         ggml_vk_ctx_end(compute_ctx);
+        if (timing != nullptr) {
+            timing->command_end_us += ssd_expert_timing_now_us() - cmd_end_start_us;
+        }
 
+        const int64_t input_copy_start_us = timing != nullptr ? ssd_expert_timing_now_us() : 0;
         for (auto& cpy : compute_ctx->in_memcpys) {
             memcpy(cpy.dst, cpy.src, cpy.n);
         }
+        if (timing != nullptr) {
+            timing->input_copy_us += ssd_expert_timing_now_us() - input_copy_start_us;
+        }
 
+        const int64_t queue_submit_start_us = timing != nullptr ? ssd_expert_timing_now_us() : 0;
         ggml_vk_submit(compute_ctx, {});
+        if (timing != nullptr) {
+            timing->queue_submit_us += ssd_expert_timing_now_us() - queue_submit_start_us;
+        }
         ctx->submit_pending = true;
     }
     if (timing != nullptr) {
@@ -14063,7 +14272,9 @@ static void ggml_vk_synchronize(
             ctx->device->compute_queue.queue.submit({}, ctx->fence);
         }
         if (timing != nullptr) {
-            timing->fence_submit_us += ssd_expert_timing_now_us() - fence_submit_start_us;
+            const int64_t fence_submit_us = ssd_expert_timing_now_us() - fence_submit_start_us;
+            timing->fence_submit_us += fence_submit_us;
+            timing->queue_submit_us += fence_submit_us;
         }
         const int64_t fence_wait_start_us = timing != nullptr ? ssd_expert_timing_now_us() : 0;
         ggml_vk_wait_for_fence(ctx);
@@ -14578,6 +14789,19 @@ offload_buffer_manager_new_t om_519 = {};
 struct ssd_expert_timing_data {
     int64_t plan_us = 0;
     int64_t expert_load_us = 0;
+    int64_t staging_alloc_us = 0;
+    int64_t upload_enqueue_us = 0;
+    int64_t upload_sync_us = 0;
+    int64_t upload_staging_memcpy_us = 0;
+    int64_t upload_cmd_begin_us = 0;
+    int64_t upload_copy_record_us = 0;
+    int64_t upload_cmd_end_us = 0;
+    int64_t upload_queue_submit_us = 0;
+    int64_t upload_fence_wait_us = 0;
+    int64_t upload_metadata_us = 0;
+    int64_t upload_total_us = 0;
+    size_t n_slice_loads = 0;
+    size_t n_slice_bytes = 0;
     size_t n_loads = 0;
 };
 
@@ -14625,15 +14849,48 @@ static bool offload_expert_load_slice(
         return false;
     }
 
+    const bool ssd_timing = ssd_expert_timing_capture_active();
+    const int64_t staging_start_us = ssd_timing ? ssd_expert_timing_now_us() : 0;
     std::vector<char> weight_buf(n_bytes);
+    if (ssd_timing) {
+        ssd_expert_timing.staging_alloc_us += ssd_expert_timing_now_us() - staging_start_us;
+    }
     if (!provider.read(provider.user_data, layer_id, expert_id, kind, weight_buf.data(), n_bytes)) {
         GGML_LOG_ERROR("%s: failed to read SSD expert slice: layer=%d expert=%d kind=%s n_bytes=%zu\n",
                 __func__, layer_id, expert_id, kind_name, n_bytes);
         return false;
     }
 
+    if (ssd_timing) {
+        ssd_expert_upload_timing = {};
+        ssd_expert_upload_timing.active = true;
+    }
+    const int64_t upload_total_start_us = ssd_timing ? ssd_expert_timing_now_us() : 0;
+    const int64_t upload_enqueue_start_us = upload_total_start_us;
     ggml_backend_vk_set_tensor_async(om_519.backend, tensor, weight_buf.data(), tensor_offset, n_bytes);
-    ggml_vk_synchronize(ctx);
+    if (ssd_timing) {
+        ssd_expert_timing.upload_enqueue_us += ssd_expert_timing_now_us() - upload_enqueue_start_us;
+    }
+    const int64_t upload_sync_start_us = ssd_timing ? ssd_expert_timing_now_us() : 0;
+    ggml_vk_synchronize(ctx, ssd_timing ? &ssd_expert_upload_timing.sync : nullptr);
+    if (ssd_timing) {
+        ssd_expert_timing.upload_sync_us += ssd_expert_timing_now_us() - upload_sync_start_us;
+        const int64_t upload_total_us = ssd_expert_timing_now_us() - upload_total_start_us;
+        const auto & detail = ssd_expert_upload_timing;
+        const int64_t known_us = detail.cmd_begin_us + detail.copy_record_us + detail.sync.command_end_us +
+                detail.sync.input_copy_us + detail.sync.queue_submit_us + detail.sync.fence_wait_us;
+        ssd_expert_timing.upload_staging_memcpy_us += detail.sync.input_copy_us;
+        ssd_expert_timing.upload_cmd_begin_us += detail.cmd_begin_us;
+        ssd_expert_timing.upload_copy_record_us += detail.copy_record_us;
+        ssd_expert_timing.upload_cmd_end_us += detail.sync.command_end_us;
+        ssd_expert_timing.upload_queue_submit_us += detail.sync.queue_submit_us;
+        ssd_expert_timing.upload_fence_wait_us += detail.sync.fence_wait_us;
+        ssd_expert_timing.upload_metadata_us += std::max<int64_t>(0, upload_total_us - known_us);
+        ssd_expert_timing.upload_total_us += upload_total_us;
+        ssd_expert_upload_timing.active = false;
+        ++ssd_expert_timing.n_slice_loads;
+        ssd_expert_timing.n_slice_bytes += n_bytes;
+    }
     return true;
 }
 
@@ -14961,6 +15218,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
     // Reserve tensor context space for all nodes
     ctx->tensor_ctxs.resize(cgraph->n_nodes);
+    const size_t max_expert_uploads = om_519.is_inited ? 3 * om_519.n_hot_expert : 0;
+    const size_t perf_trace_query_count = 2 * (cgraph->n_nodes + max_expert_uploads + 128);
+    GGML_ASSERT(perf_trace_query_count <= std::numeric_limits<uint32_t>::max());
+    ggml_vk_perf_trace_reset(ctx, static_cast<uint32_t>(perf_trace_query_count));
 
     bool first_node_in_batch = true; // true if next node will be first node in a batch
     int submit_node_idx = 0; // index to first node in a batch
@@ -15261,7 +15522,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                       (almost_ready && !ctx->almost_ready_fence_pending) ||
                       direct_ssd_layer >= 0;
 
-        bool enqueued = ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx], submit_node_idx, i + ctx->num_additional_fused_ops >= last_node, almost_ready, submit);
+        bool enqueued = ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx], submit_node_idx,
+                i + ctx->num_additional_fused_ops >= last_node, almost_ready, submit,
+                ggml_vk_perf_trace_stage_for_node(cgraph->nodes[i]));
 
         if (vk_perf_logger_enabled && enqueued) {
             compute_ctx = ggml_vk_get_compute_ctx(ctx);
@@ -15330,13 +15593,36 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 return GGML_STATUS_FAILED;
             }
 
+            const bool ssd_timing = ctx->ssd_timing.active;
+            const int64_t argsort_copy_start_us = ssd_timing ? ssd_expert_timing_now_us() : 0;
             om_519.argsort_buffer.resize(argsort_elements);
+            if (ssd_timing) {
+                ssd_argsort_copy_timing = {};
+                ssd_argsort_copy_timing.active = true;
+            }
             ggml_backend_vk_get_tensor_async(backend, argsort, om_519.argsort_buffer.data(), 0, argsort_size);
-            ggml_vk_synchronize(ctx);
+            ggml_vk_synchronize(ctx, ssd_timing ? &ssd_argsort_copy_timing.sync : nullptr);
+            if (ssd_timing) {
+                const int64_t argsort_copy_us = ssd_expert_timing_now_us() - argsort_copy_start_us;
+                const auto & detail = ssd_argsort_copy_timing;
+                GGML_LOG_INFO("[PERF_TRACE][expert_argsort_host_copy] layer=%d tokens=%zu bytes=%zu command_record=%.3f ms queue_submit=%.3f ms fence_wait=%.3f ms map=0.000 ms memcpy=%.3f ms unmap=0.000 ms total=%.3f ms persistent_map=1\n",
+                        direct_ssd_layer, n_tokens, argsort_size,
+                        detail.command_record_us / 1000.0, detail.sync.queue_submit_us / 1000.0,
+                        detail.sync.fence_wait_us / 1000.0, detail.sync.output_copy_us / 1000.0,
+                        argsort_copy_us / 1000.0);
+                ssd_argsort_copy_timing.active = false;
+            }
 
-            if (!ggml_backend_vk_apply_ssd_expert_cache(
+            const int64_t cache_apply_start_us = ssd_timing ? ssd_expert_timing_now_us() : 0;
+            const bool cache_applied = ggml_backend_vk_apply_ssd_expert_cache(
                         backend, cgraph, direct_ssd_layer,
-                        om_519.argsort_buffer.data(), n_tokens)) {
+                        om_519.argsort_buffer.data(), n_tokens);
+            if (ssd_timing) {
+                const int64_t cache_apply_us = ssd_expert_timing_now_us() - cache_apply_start_us;
+                GGML_LOG_INFO("[PERF_TRACE][expert_cache_apply_cpu] layer=%d wave=0/%u tokens=%zu elapsed=%.3f ms\n",
+                        direct_ssd_layer, om_519.n_hot_expert, n_tokens, cache_apply_us / 1000.0);
+            }
+            if (!cache_applied) {
                 return GGML_STATUS_FAILED;
             }
         }
@@ -15398,6 +15684,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     } else if (!ctx->device->support_async) {
         ggml_vk_synchronize(ctx);
     }
+
+    ggml_vk_perf_trace_log_gpu_stages(ctx);
 
     return GGML_STATUS_SUCCESS;
 
@@ -15480,6 +15768,20 @@ bool ggml_backend_vk_apply_ssd_expert_cache_wave(
         cache.expert_load_us += ssd_expert_timing.expert_load_us;
         cache.mapped_upload_us += mapped_us;
         cache.total_us += total_us;
+        GGML_LOG_INFO("[PERF_TRACE][expert_cache_transfer] layer=%d wave=%u/%u loads=%zu slices=%zu bytes=%zu staging_alloc=%.3f ms upload_enqueue=%.3f ms upload_sync_wait=%.3f ms\n",
+                layer_id, wave, wave_capacity, ssd_expert_timing.n_loads, ssd_expert_timing.n_slice_loads,
+                ssd_expert_timing.n_slice_bytes, ssd_expert_timing.staging_alloc_us / 1000.0,
+                ssd_expert_timing.upload_enqueue_us / 1000.0, ssd_expert_timing.upload_sync_us / 1000.0);
+        GGML_LOG_INFO("[PERF_TRACE][expert_upload_enqueue] layer=%d wave=%u/%u staging_memcpy=%.3f ms cmd_begin=%.3f ms copy_record=%.3f ms cmd_end=%.3f ms queue_submit=%.3f ms fence_wait=%.3f ms metadata=%.3f ms total=%.3f ms\n",
+                layer_id, wave, wave_capacity,
+                ssd_expert_timing.upload_staging_memcpy_us / 1000.0,
+                ssd_expert_timing.upload_cmd_begin_us / 1000.0,
+                ssd_expert_timing.upload_copy_record_us / 1000.0,
+                ssd_expert_timing.upload_cmd_end_us / 1000.0,
+                ssd_expert_timing.upload_queue_submit_us / 1000.0,
+                ssd_expert_timing.upload_fence_wait_us / 1000.0,
+                ssd_expert_timing.upload_metadata_us / 1000.0,
+                ssd_expert_timing.upload_total_us / 1000.0);
     }
 
     return true;
@@ -15565,6 +15867,21 @@ bool ggml_backend_vk_apply_ssd_expert_cache(
         cache.expert_load_us += ssd_expert_timing.expert_load_us;
         cache.mapped_upload_us += mapped_us;
         cache.total_us += total_us;
+        GGML_LOG_INFO("[PERF_TRACE][expert_cache_transfer] layer=%d wave=0/%u loads=%zu slices=%zu bytes=%zu staging_alloc=%.3f ms upload_enqueue=%.3f ms upload_sync_wait=%.3f ms mapped_upload=%.3f ms\n",
+                layer_id, om_519.n_hot_expert, ssd_expert_timing.n_loads, ssd_expert_timing.n_slice_loads,
+                ssd_expert_timing.n_slice_bytes, ssd_expert_timing.staging_alloc_us / 1000.0,
+                ssd_expert_timing.upload_enqueue_us / 1000.0, ssd_expert_timing.upload_sync_us / 1000.0,
+                mapped_us / 1000.0);
+        GGML_LOG_INFO("[PERF_TRACE][expert_upload_enqueue] layer=%d wave=0/%u staging_memcpy=%.3f ms cmd_begin=%.3f ms copy_record=%.3f ms cmd_end=%.3f ms queue_submit=%.3f ms fence_wait=%.3f ms metadata=%.3f ms total=%.3f ms\n",
+                layer_id, om_519.n_hot_expert,
+                ssd_expert_timing.upload_staging_memcpy_us / 1000.0,
+                ssd_expert_timing.upload_cmd_begin_us / 1000.0,
+                ssd_expert_timing.upload_copy_record_us / 1000.0,
+                ssd_expert_timing.upload_cmd_end_us / 1000.0,
+                ssd_expert_timing.upload_queue_submit_us / 1000.0,
+                ssd_expert_timing.upload_fence_wait_us / 1000.0,
+                ssd_expert_timing.upload_metadata_us / 1000.0,
+                ssd_expert_timing.upload_total_us / 1000.0);
     }
 
     return true;
@@ -15573,8 +15890,9 @@ bool ggml_backend_vk_apply_ssd_expert_cache(
 bool ggml_backend_vk_ssd_timing_begin(
         ggml_backend_t backend,
         bool prefill,
-        size_t n_tokens) {
-    if (!ssd_expert_timing_enabled() || !ggml_backend_is_vk(backend)) {
+        size_t n_tokens,
+        bool force_enable) {
+    if ((!force_enable && !ssd_expert_timing_enabled()) || !ggml_backend_is_vk(backend)) {
         return false;
     }
 

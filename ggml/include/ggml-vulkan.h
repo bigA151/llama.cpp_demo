@@ -103,7 +103,8 @@ GGML_BACKEND_API bool ggml_backend_vk_apply_ssd_expert_cache(
 GGML_BACKEND_API bool ggml_backend_vk_ssd_timing_begin(
         ggml_backend_t backend,
         bool prefill,
-        size_t n_tokens);
+        size_t n_tokens,
+        bool force_enable);
 
 GGML_BACKEND_API bool ggml_backend_vk_ssd_timing_end(ggml_backend_t backend);
 
